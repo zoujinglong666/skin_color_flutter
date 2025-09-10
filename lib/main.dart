@@ -17,7 +17,7 @@ enum AnalysisMode {
   manualRect,    // 手动框选模式
 }
 
-/// 肤色分析结果数据类
+/// 肤色分析结果数据类（进阶版）
 class SkinColorResult {
   final String id;
   final Offset position;
@@ -25,10 +25,16 @@ class SkinColorResult {
   final String rgbValue;
   final String hsvValue;
   final String hexValue;
+  final String labValue;
+  final String ycbcrValue;
   final String toneType;
   final String warmCoolType;
+  final String colorBias; // 偏色分析：偏黄/偏粉/中性
+  final String skinCategory; // 肤色类别：白皙/浅色/中等/小麦/深色
+  final double confidence; // 肤色置信度 0-1
   final String emoji;
   final DateTime createdAt;
+  final Map<String, dynamic> advancedMetrics; // 高级指标
 
   SkinColorResult({
     required this.id,
@@ -37,11 +43,360 @@ class SkinColorResult {
     required this.rgbValue,
     required this.hsvValue,
     required this.hexValue,
+    required this.labValue,
+    required this.ycbcrValue,
     required this.toneType,
     required this.warmCoolType,
+    required this.colorBias,
+    required this.skinCategory,
+    required this.confidence,
     required this.emoji,
     required this.createdAt,
+    required this.advancedMetrics,
   });
+}
+
+/// 高级颜色空间转换工具类
+class ColorSpaceConverter {
+  /// RGB转CIELAB色彩空间
+  static List<double> rgbToLab(int r, int g, int b) {
+    // 转换为标准RGB (0-1)
+    double rNorm = r / 255.0;
+    double gNorm = g / 255.0;
+    double bNorm = b / 255.0;
+    
+    // sRGB到线性RGB的转换
+    rNorm = rNorm <= 0.04045 ? rNorm / 12.92 : Math.pow((rNorm + 0.055) / 1.055, 2.4).toDouble();
+    gNorm = gNorm <= 0.04045 ? gNorm / 12.92 : Math.pow((gNorm + 0.055) / 1.055, 2.4).toDouble();
+    bNorm = bNorm <= 0.04045 ? bNorm / 12.92 : Math.pow((bNorm + 0.055) / 1.055, 2.4).toDouble();
+    
+    // 线性RGB到XYZ的转换 (D65标准光源)
+    double x = rNorm * 0.4124564 + gNorm * 0.3575761 + bNorm * 0.1804375;
+    double y = rNorm * 0.2126729 + gNorm * 0.7151522 + bNorm * 0.0721750;
+    double z = rNorm * 0.0193339 + gNorm * 0.1191920 + bNorm * 0.9503041;
+    
+    // XYZ到Lab的转换
+    // 参考白点D65
+    const xn = 0.95047;
+    const yn = 1.0;
+    const zn = 1.08883;
+    
+    x = x / xn;
+    y = y / yn;
+    z = z / zn;
+    
+    const delta = 6.0 / 29.0;
+    const deltaSquared = delta * delta;
+    const deltaCubed = delta * delta * delta;
+    
+    x = x > deltaCubed ? Math.pow(x, 1/3).toDouble() : (x / (3 * deltaSquared)) + (4.0 / 29.0);
+    y = y > deltaCubed ? Math.pow(y, 1/3).toDouble() : (y / (3 * deltaSquared)) + (4.0 / 29.0);
+    z = z > deltaCubed ? Math.pow(z, 1/3).toDouble() : (z / (3 * deltaSquared)) + (4.0 / 29.0);
+    
+    final L = (116 * y) - 16;
+    final a = 500 * (x - y);
+    final b_component = 200 * (y - z);
+    
+    return [L, a, b_component];
+  }
+  
+  /// RGB转YCbCr色彩空间
+  static List<double> rgbToYCbCr(int r, int g, int b) {
+    final Y = 0.299 * r + 0.587 * g + 0.114 * b;
+    final Cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+    final Cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+    
+    return [Y, Cb, Cr];
+  }
+  
+  /// 计算颜色在YCbCr空间的肤色置信度
+  static double calculateSkinConfidence(List<double> ycbcr) {
+    final cb = ycbcr[1];
+    final cr = ycbcr[2];
+    
+    // 基于研究的肤色分布范围
+    const cbMin = 77.0, cbMax = 127.0;
+    const crMin = 133.0, crMax = 173.0;
+    
+    // 计算在肤色范围内的程度
+    double cbScore = 0.0;
+    double crScore = 0.0;
+    
+    if (cb >= cbMin && cb <= cbMax) {
+      cbScore = 1.0 - (Math.min((cb - cbMin).abs(), (cb - cbMax).abs()) / ((cbMax - cbMin) / 2));
+    }
+    
+    if (cr >= crMin && cr <= crMax) {
+      crScore = 1.0 - (Math.min((cr - crMin).abs(), (cr - crMax).abs()) / ((crMax - crMin) / 2));
+    }
+    
+    return (cbScore * crScore).clamp(0.0, 1.0);
+  }
+}
+
+/// 高级肤色检测器
+class AdvancedSkinDetector {
+  /// 高斯模糊预处理
+  static List<Color> applyGaussianBlur(List<Color> pixels, int width, int height) {
+    if (pixels.isEmpty) return pixels;
+    
+    // 简化的高斯核 (3x3)
+    final kernel = [
+      [1, 2, 1],
+      [2, 4, 2],
+      [1, 2, 1]
+    ];
+    const kernelSum = 16;
+    
+    final blurred = List<Color>.filled(pixels.length, Colors.transparent);
+    
+    for (int y = 1; y < height - 1; y++) {
+      for (int x = 1; x < width - 1; x++) {
+        int r = 0, g = 0, b = 0;
+        
+        for (int ky = -1; ky <= 1; ky++) {
+          for (int kx = -1; kx <= 1; kx++) {
+            final pixelIndex = (y + ky) * width + (x + kx);
+            if (pixelIndex >= 0 && pixelIndex < pixels.length) {
+              final pixel = pixels[pixelIndex];
+              final weight = kernel[ky + 1][kx + 1];
+              
+              r += pixel.red * weight;
+              g += pixel.green * weight;
+              b += pixel.blue * weight;
+            }
+          }
+        }
+        
+        blurred[y * width + x] = Color.fromARGB(
+          255,
+          (r / kernelSum).round().clamp(0, 255),
+          (g / kernelSum).round().clamp(0, 255),
+          (b / kernelSum).round().clamp(0, 255),
+        );
+      }
+    }
+    
+    return blurred;
+  }
+  
+  /// 基于YCbCr的肤色像素过滤
+  static List<Color> filterSkinPixels(List<Color> pixels) {
+    final skinPixels = <Color>[];
+    
+    for (final pixel in pixels) {
+      final ycbcr = ColorSpaceConverter.rgbToYCbCr(pixel.red, pixel.green, pixel.blue);
+      final confidence = ColorSpaceConverter.calculateSkinConfidence(ycbcr);
+      
+      // 只保留肤色置信度大于0.3的像素
+      if (confidence > 0.3) {
+        skinPixels.add(pixel);
+      }
+    }
+    
+    return skinPixels;
+  }
+  
+  /// 高级K-means聚类（专门针对肤色）
+  static List<List<Color>> performSkinColorClustering(List<Color> skinPixels, int k) {
+    if (skinPixels.length < k) return [skinPixels];
+    
+    // 在LAB色彩空间进行聚类以获得更好的感知一致性
+    final labPixels = skinPixels.map((color) {
+      final lab = ColorSpaceConverter.rgbToLab(color.red, color.green, color.blue);
+      return {
+        'color': color,
+        'lab': lab,
+        'ycbcr': ColorSpaceConverter.rgbToYCbCr(color.red, color.green, color.blue),
+      };
+    }).toList();
+    
+    // 初始化聚类中心（使用K-means++）
+    final centers = <Map<String, dynamic>>[];
+    final random = Math.Random();
+    
+    // 第一个中心随机选择
+    centers.add(labPixels[random.nextInt(labPixels.length)]);
+    
+    // 后续中心使用K-means++策略
+    for (int i = 1; i < k; i++) {
+      final distances = <double>[];
+      double totalDistance = 0;
+      
+      for (final pixel in labPixels) {
+        double minDistance = double.infinity;
+        for (final center in centers) {
+          final distance = _calculateLabDistance(
+            pixel['lab'] as List<double>,
+            center['lab'] as List<double>
+          );
+          if (distance < minDistance) {
+            minDistance = distance;
+          }
+        }
+        distances.add(minDistance * minDistance);
+        totalDistance += minDistance * minDistance;
+      }
+      
+      // 轮盘赌选择
+      final threshold = random.nextDouble() * totalDistance;
+      double sum = 0;
+      int selectedIndex = labPixels.length - 1;
+      
+      for (int j = 0; j < labPixels.length; j++) {
+        sum += distances[j];
+        if (sum >= threshold) {
+          selectedIndex = j;
+          break;
+        }
+      }
+      
+      centers.add(labPixels[selectedIndex]);
+    }
+    
+    // 迭代聚类
+    const maxIterations = 20;
+    const convergenceThreshold = 1.0;
+    
+    for (int iteration = 0; iteration < maxIterations; iteration++) {
+      final clusters = List.generate(k, (index) => <Map<String, dynamic>>[]);
+      
+      // 分配像素到最近的聚类中心
+      for (final pixel in labPixels) {
+        int closestCenter = 0;
+        double minDistance = _calculateLabDistance(
+          pixel['lab'] as List<double>,
+          centers[0]['lab'] as List<double>
+        );
+        
+        for (int i = 1; i < centers.length; i++) {
+          final distance = _calculateLabDistance(
+            pixel['lab'] as List<double>,
+            centers[i]['lab'] as List<double>
+          );
+          
+          if (distance < minDistance) {
+            minDistance = distance;
+            closestCenter = i;
+          }
+        }
+        
+        clusters[closestCenter].add(pixel);
+      }
+      
+      // 更新聚类中心
+      bool converged = true;
+      for (int i = 0; i < k; i++) {
+        if (clusters[i].isNotEmpty) {
+          final newCenter = _calculateClusterCenter(clusters[i]);
+          final distance = _calculateLabDistance(
+            centers[i]['lab'] as List<double>,
+            newCenter['lab'] as List<double>
+          );
+          
+          if (distance > convergenceThreshold) {
+            centers[i] = newCenter;
+            converged = false;
+          }
+        }
+      }
+      
+      if (converged) break;
+    }
+    
+    // 返回颜色聚类结果
+    final result = <List<Color>>[];
+    for (int i = 0; i < k; i++) {
+      final cluster = <Color>[];
+      for (final pixel in labPixels) {
+        int closestCenter = 0;
+        double minDistance = _calculateLabDistance(
+          pixel['lab'] as List<double>,
+          centers[0]['lab'] as List<double>
+        );
+        
+        for (int j = 1; j < centers.length; j++) {
+          final distance = _calculateLabDistance(
+            pixel['lab'] as List<double>,
+            centers[j]['lab'] as List<double>
+          );
+          
+          if (distance < minDistance) {
+            minDistance = distance;
+            closestCenter = j;
+          }
+        }
+        
+        if (closestCenter == i) {
+          cluster.add(pixel['color'] as Color);
+        }
+      }
+      
+      if (cluster.isNotEmpty) {
+        result.add(cluster);
+      }
+    }
+    
+    return result;
+  }
+  
+  /// 计算LAB色彩空间距离
+  static double _calculateLabDistance(List<double> lab1, List<double> lab2) {
+    final dL = lab1[0] - lab2[0];
+    final da = lab1[1] - lab2[1];
+    final db = lab1[2] - lab2[2];
+    
+    // 使用CIEDE2000色差公式的简化版本
+    return Math.sqrt(dL * dL + da * da + db * db);
+  }
+  
+  /// 计算聚类中心
+  static Map<String, dynamic> _calculateClusterCenter(List<Map<String, dynamic>> cluster) {
+    if (cluster.isEmpty) {
+      return {
+        'color': Colors.grey,
+        'lab': [50.0, 0.0, 0.0],
+        'ycbcr': [128.0, 128.0, 128.0],
+      };
+    }
+    
+    double totalL = 0, totalA = 0, totalB = 0;
+    double totalY = 0, totalCb = 0, totalCr = 0;
+    int totalR = 0, totalG = 0, totalBlue = 0;
+    
+    for (final pixel in cluster) {
+      final lab = pixel['lab'] as List<double>;
+      final ycbcr = pixel['ycbcr'] as List<double>;
+      final color = pixel['color'] as Color;
+      
+      totalL += lab[0];
+      totalA += lab[1];
+      totalB += lab[2];
+      
+      totalY += ycbcr[0];
+      totalCb += ycbcr[1];
+      totalCr += ycbcr[2];
+      
+      totalR += color.red;
+      totalG += color.green;
+      totalBlue += color.blue;
+    }
+    
+    final count = cluster.length;
+    final avgL = totalL / count;
+    final avgA = totalA / count;
+    final avgB = totalB / count;
+    
+    final avgR = (totalR / count).round();
+    final avgG = (totalG / count).round();
+    final avgBlue = (totalBlue / count).round();
+    
+    return {
+      'color': Color.fromARGB(255, avgR, avgG, avgBlue),
+      'lab': [avgL, avgA, avgB],
+      'ycbcr': [totalY / count, totalCb / count, totalCr / count],
+    };
+  }
 }
 
 /// 莫兰迪色系主题配置
@@ -151,6 +506,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   // 智能分析相关
   List<Map<String, dynamic>> _smartAnalysisPoints = [];
   bool _isShowingScanAnimation = false;
+  int? _selectedColorPointIndex; // 选中的颜色指示点索引
   
   @override
   void initState() {
@@ -371,7 +727,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     print('智能分析动画完成'); // 调试日志
   }
 
-  /// 智能分析模式 - 分析图片唯一主色 (升级版)
+  /// 高级智能分析模式 - 进阶版肤色检测算法
   Future<void> _performSmartAnalysis() async {
     if (_selectedImage == null || _imageSize == null) return;
 
@@ -385,29 +741,29 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       final image = img.decodeImage(bytes);
       
       if (image != null) {
-        // 自适应区域采样策略：根据图像特征选择采样区域
-        final allSamples = <Color>[];
+        print('开始高级肤色分析，图片尺寸: ${image.width}x${image.height}');
+        
+        // 第一步：预处理 - 采样和噪声过滤
+        final rawSamples = <Color>[];
         final regionSamples = <String, List<Color>>{};
         
-        // 图像分区采样 - 将图像分为9个区域，分别采样
-        final regionWidth = image.width / 3;
-        final regionHeight = image.height / 3;
+        // 自适应采样策略
+        final sampleDensity = _calculateOptimalSampleDensity(image.width, image.height);
+        final stepX = Math.max(1, (image.width / sampleDensity).round());
+        final stepY = Math.max(1, (image.height / sampleDensity).round());
         
-        // 降采样以提高性能，但保持足够的采样密度
-        final stepX = Math.max(1, (image.width / 150).round());
-        final stepY = Math.max(1, (image.height / 150).round());
-        
-        // 计算每个区域的颜色样本
+        // 分区域采样 (3x3网格)
         for (int regionY = 0; regionY < 3; regionY++) {
           for (int regionX = 0; regionX < 3; regionX++) {
             final regionKey = '$regionX-$regionY';
-            regionSamples[regionKey] = [];
+            final regionPixels = <Color>[];
             
-            final startX = (regionX * regionWidth).round();
-            final startY = (regionY * regionHeight).round();
-            final endX = ((regionX + 1) * regionWidth).round();
-            final endY = ((regionY + 1) * regionHeight).round();
+            final startX = (regionX * image.width / 3).round();
+            final startY = (regionY * image.height / 3).round();
+            final endX = ((regionX + 1) * image.width / 3).round();
+            final endY = ((regionY + 1) * image.height / 3).round();
             
+            // 区域内采样
             for (int y = startY; y < endY; y += stepY) {
               for (int x = startX; x < endX; x += stepX) {
                 if (x < image.width && y < image.height) {
@@ -419,99 +775,108 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                     pixel.b.toInt(),
                   );
                   
-                  // 增强的颜色过滤 - 使用HSV空间进行更精确的过滤
-                  final hsv = HSVColor.fromColor(color);
-                  final brightness = (color.red + color.green + color.blue) / 3;
-                  final saturation = hsv.saturation;
-                  
-                  // 肤色范围过滤 - 基于研究的肤色范围
-                  final isInSkinToneRange = _isLikelySkinTone(color);
-                  
-                  // 过滤条件：亮度适中、饱和度合理、可能是肤色
-                  if (brightness > 50 && brightness < 220 && 
-                      saturation > 0.05 && saturation < 0.85) {
-                    regionSamples[regionKey]!.add(color);
-                    allSamples.add(color);
-                  }
+                  regionPixels.add(color);
+                  rawSamples.add(color);
                 }
               }
+            }
+            
+            regionSamples[regionKey] = regionPixels;
+          }
+        }
+        
+        print('采样完成，总样本数: ${rawSamples.length}');
+        
+        // 第二步：高斯模糊预处理（针对每个区域）
+        final processedRegions = <String, List<Color>>{};
+        for (final entry in regionSamples.entries) {
+          if (entry.value.isNotEmpty) {
+            // 简化的区域处理 - 应用均值滤波
+            final filtered = _applyMeanFilter(entry.value);
+            processedRegions[entry.key] = filtered;
+          }
+        }
+        
+        // 第三步：肤色像素过滤
+        final regionAnalysis = <String, Map<String, dynamic>>{};
+        for (final entry in processedRegions.entries) {
+          final skinPixels = AdvancedSkinDetector.filterSkinPixels(entry.value);
+          
+          if (skinPixels.isNotEmpty) {
+            // 第四步：K-means聚类提取主要肤色
+            final clusters = AdvancedSkinDetector.performSkinColorClustering(skinPixels, 3);
+            
+            if (clusters.isNotEmpty) {
+              // 选择最大的聚类作为该区域的代表色
+              clusters.sort((a, b) => b.length.compareTo(a.length));
+              final dominantCluster = clusters.first;
+              final dominantColor = _calculateClusterAverage(dominantCluster);
+              
+              // 计算肤色置信度
+              final ycbcr = ColorSpaceConverter.rgbToYCbCr(
+                dominantColor.red, dominantColor.green, dominantColor.blue
+              );
+              final confidence = ColorSpaceConverter.calculateSkinConfidence(ycbcr);
+              
+              regionAnalysis[entry.key] = {
+                'color': dominantColor,
+                'count': skinPixels.length,
+                'confidence': confidence,
+                'isSkinTone': confidence > 0.5,
+                'clusterSize': dominantCluster.length,
+              };
             }
           }
         }
         
-        // 分析每个区域的颜色分布
-        final regionAnalysis = <String, Map<String, dynamic>>{};
-        for (final entry in regionSamples.entries) {
-          if (entry.value.isNotEmpty) {
-            final dominantColor = _extractDominantColor(entry.value);
-            final labColor = _rgbToLab(dominantColor.red, dominantColor.green, dominantColor.blue);
-            
-            regionAnalysis[entry.key] = {
-              'color': dominantColor,
-              'count': entry.value.length,
-              'lab': labColor,
-              'isSkinTone': _isLikelySkinTone(dominantColor),
-            };
-          }
-        }
+        print('肤色分析完成，有效区域数: ${regionAnalysis.length}');
         
-        // 智能选择最可能的肤色区域
-        Color? selectedColor;
-        String regionDescription = '图片主色调';
-        
-        // 首先尝试找到肤色区域
-        final skinToneRegions = regionAnalysis.entries
-            .where((e) => e.value['isSkinTone'] == true)
-            .toList();
-        
-        if (skinToneRegions.isNotEmpty) {
-          // 按样本数量排序，选择样本最多的肤色区域
-          skinToneRegions.sort((a, b) => 
-              (b.value['count'] as int).compareTo(a.value['count'] as int));
-          selectedColor = skinToneRegions.first.value['color'] as Color;
-          regionDescription = '检测到的肤色';
-        } else if (allSamples.isNotEmpty) {
-          // 如果没有明显的肤色区域，使用全图聚类
-          selectedColor = _extractDominantColor(allSamples);
-        }
-        
-        // 生成智能分析的颜色指示点
+        // 第五步：生成智能分析的颜色指示点
         if (_displaySize != null && regionAnalysis.isNotEmpty) {
           final newSmartAnalysisPoints = <Map<String, dynamic>>[];
           
-          // 选择最具代表性的几个区域作为指示点
+          // 按置信度和样本数量排序
           final sortedRegions = regionAnalysis.entries.toList()
-            ..sort((a, b) => (b.value['count'] as int).compareTo(a.value['count'] as int));
+            ..sort((a, b) {
+              final aScore = (a.value['confidence'] as double) * (a.value['count'] as int);
+              final bScore = (b.value['confidence'] as double) * (b.value['count'] as int);
+              return bScore.compareTo(aScore);
+            });
           
-          // 最多显示5个指示点
-          final maxPoints = Math.min(5, sortedRegions.length);
+          // 最多显示6个高质量指示点
+          final maxPoints = Math.min(6, sortedRegions.length);
           
           for (int i = 0; i < maxPoints; i++) {
             final regionKey = sortedRegions[i].key;
             final regionData = sortedRegions[i].value;
             final color = regionData['color'] as Color;
+            final confidence = regionData['confidence'] as double;
             
-            // 计算区域在显示坐标系中的位置
-            final regionCoords = regionKey.split('-');
-            final regionX = int.parse(regionCoords[0]);
-            final regionY = int.parse(regionCoords[1]);
-            
-            final displayX = (regionX + 0.5) * _displaySize!.width / 3;
-            final displayY = (regionY + 0.5) * _displaySize!.height / 3;
-            
-            final position = Offset(displayX, displayY);
-            
-            // 分析颜色特征
-            final result = _analyzeSkinTone(color, position, '区域 ${i + 1}');
-            
-            newSmartAnalysisPoints.add({
-              'position': position,
-              'color': color,
-              'result': result,
-              'regionKey': regionKey,
-              'sampleCount': regionData['count'],
-              'isSkinTone': regionData['isSkinTone'],
-            });
+            // 只显示高置信度的肤色区域
+            if (confidence > 0.3) {
+              // 计算区域在显示坐标系中的位置
+              final regionCoords = regionKey.split('-');
+              final regionX = int.parse(regionCoords[0]);
+              final regionY = int.parse(regionCoords[1]);
+              
+              final displayX = (regionX + 0.5) * _displaySize!.width / 3;
+              final displayY = (regionY + 0.5) * _displaySize!.height / 3;
+              
+              final position = Offset(displayX, displayY);
+              
+              // 使用高级算法分析颜色特征
+              final result = _analyzeSkinTone(color, position, '肤色区域 ${i + 1}');
+              
+              newSmartAnalysisPoints.add({
+                'position': position,
+                'color': color,
+                'result': result,
+                'regionKey': regionKey,
+                'sampleCount': regionData['count'],
+                'confidence': confidence,
+                'isSkinTone': regionData['isSkinTone'],
+              });
+            }
           }
           
           // 更新状态
@@ -521,32 +886,101 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             });
           }
           
-          // 如果有主要的肤色区域，也添加到分析结果中
-          if (selectedColor != null) {
-            final centerPoint = Offset(
-              _displaySize!.width / 2,
-              _displaySize!.height / 2,
-            );
+          // 选择最佳肤色区域添加到分析结果
+          if (sortedRegions.isNotEmpty) {
+            final bestRegion = sortedRegions.first;
+            final bestColor = bestRegion.value['color'] as Color;
+            final bestConfidence = bestRegion.value['confidence'] as double;
             
-            final result = _analyzeSkinTone(selectedColor, centerPoint, regionDescription);
-            
-            if (mounted) {
-              setState(() {
-                _analysisResults.add(result);
-              });
+            if (bestConfidence > 0.5) {
+              final centerPoint = Offset(
+                _displaySize!.width / 2,
+                _displaySize!.height / 2,
+              );
+              
+              final result = _analyzeSkinTone(bestColor, centerPoint, '主要肤色 (置信度: ${(bestConfidence * 100).toStringAsFixed(1)}%)');
+              
+              if (mounted) {
+                setState(() {
+                  _analysisResults.add(result);
+                });
+              }
             }
           }
           
-          print('智能分析完成，生成了 ${newSmartAnalysisPoints.length} 个指示点'); // 调试日志
+          print('高级分析完成，生成了 ${newSmartAnalysisPoints.length} 个高质量指示点');
         }
       }
     } catch (e) {
-      print('智能分析失败: $e');
+      print('高级智能分析失败: $e');
     }
 
     setState(() {
       _isAnalyzing = false;
     });
+  }
+  
+  /// 计算最优采样密度
+  int _calculateOptimalSampleDensity(int width, int height) {
+    final totalPixels = width * height;
+    
+    if (totalPixels > 1000000) { // 大于1MP
+      return 200;
+    } else if (totalPixels > 500000) { // 大于0.5MP
+      return 150;
+    } else {
+      return 100;
+    }
+  }
+  
+  /// 简化的均值滤波
+  List<Color> _applyMeanFilter(List<Color> pixels) {
+    if (pixels.length < 9) return pixels;
+    
+    final filtered = <Color>[];
+    const kernelSize = 3;
+    
+    for (int i = kernelSize; i < pixels.length - kernelSize; i += kernelSize) {
+      int r = 0, g = 0, b = 0;
+      int count = 0;
+      
+      for (int j = i - kernelSize; j <= i + kernelSize && j < pixels.length; j++) {
+        r += pixels[j].red;
+        g += pixels[j].green;
+        b += pixels[j].blue;
+        count++;
+      }
+      
+      if (count > 0) {
+        filtered.add(Color.fromARGB(
+          255,
+          (r / count).round(),
+          (g / count).round(),
+          (b / count).round(),
+        ));
+      }
+    }
+    
+    return filtered.isNotEmpty ? filtered : pixels;
+  }
+  
+  /// 计算聚类平均颜色
+  Color _calculateClusterAverage(List<Color> cluster) {
+    if (cluster.isEmpty) return Colors.grey;
+    
+    int totalR = 0, totalG = 0, totalB = 0;
+    for (final color in cluster) {
+      totalR += color.red;
+      totalG += color.green;
+      totalB += color.blue;
+    }
+    
+    return Color.fromARGB(
+      255,
+      (totalR / cluster.length).round(),
+      (totalG / cluster.length).round(),
+      (totalB / cluster.length).round(),
+    );
   }
   
   /// 判断颜色是否可能是肤色
@@ -1007,6 +1441,24 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         _scaleController.reverse();
       });
       _analyzeSkinColorAtPoint(localPosition, '自定义区域 ${_analysisResults.length + 1}');
+    } else if (_analysisMode == AnalysisMode.smartAnalysis) {
+      // 智能模式：检查是否点击了颜色指示点
+      final clickedPointIndex = _getClickedColorPointIndex(localPosition);
+      if (clickedPointIndex != null) {
+        HapticFeedback.selectionClick();
+        setState(() {
+          _selectedColorPointIndex = clickedPointIndex;
+        });
+        
+        // 3秒后自动取消高亮
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted) {
+            setState(() {
+              _selectedColorPointIndex = null;
+            });
+          }
+        });
+      }
     } else if (_analysisMode == AnalysisMode.manualRect) {
       // 框选模式：检查是否点击了现有矩形的拖拽控制点
       if (_rectStartPoint != null && _currentDragPoint != null && !_isSelectingRect) {
@@ -1190,6 +1642,23 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     return null;
   }
 
+  /// 检测点击位置是否在颜色指示点上
+  int? _getClickedColorPointIndex(Offset tapPoint) {
+    const clickRadius = 30.0; // 点击检测半径
+    
+    for (int i = 0; i < _smartAnalysisPoints.length; i++) {
+      final point = _smartAnalysisPoints[i];
+      final position = point['position'] as Offset;
+      final distance = (tapPoint - position).distance;
+      
+      if (distance <= clickRadius) {
+        return i;
+      }
+    }
+    
+    return null;
+  }
+
   /// 分析指定点的肤色
   Future<void> _analyzeSkinColorAtPoint(Offset displayPoint, String label) async {
     if (_selectedImage == null || _imageSize == null || _displaySize == null) return;
@@ -1284,105 +1753,104 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     );
   }
 
-  /// 分析肤色色调 - 升级版算法
+  /// 高级肤色分析算法 - 进阶版
   SkinColorResult _analyzeSkinTone(Color color, Offset position, String label) {
     final r = color.red;
     final g = color.green;
     final b = color.blue;
     
-    // 转换为HSV
+    // 多色彩空间转换
     final hsv = HSVColor.fromColor(color);
+    final labColor = ColorSpaceConverter.rgbToLab(r, g, b);
+    final ycbcrColor = ColorSpaceConverter.rgbToYCbCr(r, g, b);
+    
+    // 提取关键指标
     final hue = hsv.hue;
     final saturation = hsv.saturation;
     final value = hsv.value;
+    final L = labColor[0]; // 明度
+    final a = labColor[1]; // 红绿轴
+    final b_lab = labColor[2]; // 黄蓝轴
+    final Y = ycbcrColor[0]; // 亮度
+    final Cb = ycbcrColor[1]; // 蓝色色度
+    final Cr = ycbcrColor[2]; // 红色色度
     
-    // 转换为Lab色彩空间进行更精确的分析
-    final labColor = _rgbToLab(r, g, b);
-    final a = labColor[1]; // a轴: 负值为绿色，正值为红色
-    final b_lab = labColor[2]; // b轴: 负值为蓝色，正值为黄色
+    // 计算肤色置信度
+    final skinConfidence = ColorSpaceConverter.calculateSkinConfidence(ycbcrColor);
     
-    // 计算色彩特征比例
-    final redYellowRatio = r / (g + 1); // 避免除零
-    final yellowRatio = (r + g) / (b + 1);
-    final redBlueRatio = r / (b + 1);
-    
-    // ITA值计算 (Individual Typology Angle) - 肤色分类的专业指标
-    final L = labColor[0];
+    // ITA值计算 (Individual Typology Angle) - 专业肤色分类指标
     final ITA = (Math.atan((L - 50) / b_lab) * 180 / Math.pi).toDouble();
     
-    // 肤色分类逻辑 - 升级版
+    // 高级肤色分类逻辑
+    String skinCategory;
     String toneType;
     String warmCoolType;
+    String colorBias;
     String emoji;
     
-    // 基于ITA值的肤色分类
+    // 基于ITA值和Lab空间的精确分类
     if (ITA > 55) {
-      // 非常白皙
-      toneType = '白皙肤色';
+      skinCategory = '白皙肤色';
+      toneType = '极浅色调';
       emoji = '✨';
-      
-      if (a > 8) {
-        warmCoolType = '暖白皙';
-      } else if (a < 0) {
-        warmCoolType = '冷白皙';
-      } else {
-        warmCoolType = '中性白皙';
-      }
     } else if (ITA > 41) {
-      // 浅色肤色
-      toneType = '浅色肤色';
+      skinCategory = '浅色肤色';
+      toneType = '浅色调';
       emoji = '🌟';
-      
-      if (a > 10 && b_lab > 15) {
-        warmCoolType = '暖浅色调';
-      } else if (a < 8) {
-        warmCoolType = '冷浅色调';
-      } else {
-        warmCoolType = '中性浅色调';
-      }
     } else if (ITA > 28) {
-      // 中等肤色
-      toneType = '中等肤色';
+      skinCategory = '中等肤色';
+      toneType = '中色调';
       emoji = '🌼';
-      
-      if (b_lab > 18 && a > 10) {
-        warmCoolType = '暖中性调';
-      } else if (b_lab < 15 || a < 8) {
-        warmCoolType = '冷中性调';
-      } else {
-        warmCoolType = '中性调';
-      }
     } else if (ITA > 10) {
-      // 小麦色
-      toneType = '小麦肤色';
+      skinCategory = '小麦肤色';
+      toneType = '深色调';
       emoji = '🌞';
-      
-      if (b_lab > 20) {
-        warmCoolType = '暖小麦色';
-      } else {
-        warmCoolType = '中性小麦色';
-      }
-    } else {
-      // 深色肤色
-      toneType = '深色肤色';
+    } else if (ITA > -30) {
+      skinCategory = '深色肤色';
+      toneType = '极深色调';
       emoji = '🌹';
-      
-      if (b_lab > 15) {
-        warmCoolType = '暖深色调';
-      } else {
-        warmCoolType = '中性深色调';
-      }
+    } else {
+      skinCategory = '极深肤色';
+      toneType = '超深色调';
+      emoji = '🖤';
     }
     
-    // 细化冷暖色调判断 - 基于色相和Lab值的综合分析
-    if (warmCoolType.contains('中性')) {
-      // 进一步细分中性调
-      if ((hue >= 20 && hue <= 40) && yellowRatio > 1.9) {
-        warmCoolType = warmCoolType.replaceAll('中性', '暖');
-      } else if ((hue >= 340 || hue <= 10) && redBlueRatio > 1.5) {
-        warmCoolType = warmCoolType.replaceAll('中性', '冷');
-      }
+    // 冷暖色调分析 - 基于多个指标的综合判断
+    final warmScore = _calculateWarmScore(hue, a, b_lab, Cr);
+    final coolScore = _calculateCoolScore(hue, a, b_lab, Cb);
+    
+    if (warmScore > coolScore + 0.2) {
+      warmCoolType = '暖色调';
+    } else if (coolScore > warmScore + 0.2) {
+      warmCoolType = '冷色调';
+    } else {
+      warmCoolType = '中性色调';
     }
+    
+    // 偏色分析 - 基于Lab空间的a*和b*值
+    if (b_lab > 15 && a > 5) {
+      colorBias = '偏黄调';
+    } else if (a > 10 && b_lab < 10) {
+      colorBias = '偏粉调';
+    } else if (a < 0) {
+      colorBias = '偏绿调';
+    } else if (b_lab < 0) {
+      colorBias = '偏蓝调';
+    } else {
+      colorBias = '中性调';
+    }
+    
+    // 高级指标计算
+    final advancedMetrics = {
+      'ITA': ITA.toStringAsFixed(2),
+      'skinConfidence': (skinConfidence * 100).toStringAsFixed(1),
+      'warmScore': (warmScore * 100).toStringAsFixed(1),
+      'coolScore': (coolScore * 100).toStringAsFixed(1),
+      'chromaIntensity': Math.sqrt(a * a + b_lab * b_lab).toStringAsFixed(2),
+      'colorPurity': (saturation * 100).toStringAsFixed(1),
+      'brightness': (value * 100).toStringAsFixed(1),
+      'labLightness': L.toStringAsFixed(1),
+    };
     
     return SkinColorResult(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -1391,11 +1859,67 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       rgbValue: 'RGB($r, $g, $b)',
       hsvValue: 'HSV(${hue.round()}°, ${(saturation * 100).round()}%, ${(value * 100).round()}%)',
       hexValue: '#${color.value.toRadixString(16).substring(2).toUpperCase()}',
+      labValue: 'LAB(${L.toStringAsFixed(1)}, ${a.toStringAsFixed(1)}, ${b_lab.toStringAsFixed(1)})',
+      ycbcrValue: 'YCbCr(${Y.toStringAsFixed(0)}, ${Cb.toStringAsFixed(0)}, ${Cr.toStringAsFixed(0)})',
       toneType: toneType,
       warmCoolType: warmCoolType,
+      colorBias: colorBias,
+      skinCategory: skinCategory,
+      confidence: skinConfidence,
       emoji: emoji,
       createdAt: DateTime.now(),
+      advancedMetrics: advancedMetrics,
     );
+  }
+  
+  /// 计算暖色调评分
+  double _calculateWarmScore(double hue, double a, double b_lab, double cr) {
+    double score = 0.0;
+    
+    // 色相评分 (黄色-橙色-红色范围)
+    if (hue >= 15 && hue <= 60) {
+      score += 0.4; // 黄橙色范围
+    } else if (hue >= 340 || hue <= 15) {
+      score += 0.3; // 红色范围
+    }
+    
+    // Lab空间b*值评分 (正值表示黄色倾向)
+    if (b_lab > 10) {
+      score += 0.3 * (b_lab / 30.0).clamp(0.0, 1.0);
+    }
+    
+    // YCbCr空间Cr值评分 (高Cr值表示红色倾向)
+    if (cr > 128) {
+      score += 0.3 * ((cr - 128) / 45.0).clamp(0.0, 1.0);
+    }
+    
+    return score.clamp(0.0, 1.0);
+  }
+  
+  /// 计算冷色调评分
+  double _calculateCoolScore(double hue, double a, double b_lab, double cb) {
+    double score = 0.0;
+    
+    // 色相评分 (蓝色-紫色-粉色范围)
+    if (hue >= 180 && hue <= 270) {
+      score += 0.4; // 蓝紫色范围
+    } else if (hue >= 270 && hue <= 340) {
+      score += 0.3; // 紫粉色范围
+    }
+    
+    // Lab空间a*值评分 (负值表示绿色倾向，正值但较小表示粉色倾向)
+    if (a < 0) {
+      score += 0.2;
+    } else if (a > 0 && a < 8 && b_lab < 5) {
+      score += 0.2; // 轻微粉色倾向
+    }
+    
+    // YCbCr空间Cb值评分 (高Cb值表示蓝色倾向)
+    if (cb > 128) {
+      score += 0.4 * ((cb - 128) / 50.0).clamp(0.0, 1.0);
+    }
+    
+    return score.clamp(0.0, 1.0);
   }
   
   /// RGB转Lab色彩空间 - 用于更精确的肤色分析
@@ -1873,6 +2397,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                                   colorPointAnimation: _colorPointAnimationController,
                                   smartAnalysisPoints: _smartAnalysisPoints,
                                   isShowingScanAnimation: _isShowingScanAnimation,
+                                  selectedColorPointIndex: _selectedColorPointIndex,
                                 ),
                               );
                             },
@@ -2131,6 +2656,7 @@ class AnalysisPainter extends CustomPainter {
   final Animation<double>? colorPointAnimation;
   final List<Map<String, dynamic>> smartAnalysisPoints;
   final bool isShowingScanAnimation;
+  final int? selectedColorPointIndex;
 
   AnalysisPainter({
     required this.detectedFaces,
@@ -2150,6 +2676,7 @@ class AnalysisPainter extends CustomPainter {
     this.colorPointAnimation,
     this.smartAnalysisPoints = const [],
     this.isShowingScanAnimation = false,
+    this.selectedColorPointIndex,
   });
 
   @override
@@ -2592,25 +3119,75 @@ class AnalysisPainter extends CustomPainter {
         // 绘制连接线到颜色信息
         if (delayedAnimation > 0.5) {
           final lineOpacity = (delayedAnimation - 0.5) * 2;
+          final isSelected = selectedColorPointIndex == i;
+          
+          // 高亮效果
+          final highlightMultiplier = isSelected ? 1.5 : 1.0;
+          final bgOpacity = isSelected ? 0.9 : 0.7;
+          
           final linePaint = Paint()
-            ..color = MorandiTheme.secondaryText.withOpacity(0.5 * lineOpacity)
+            ..color = (isSelected ? MorandiTheme.accentPink : MorandiTheme.secondaryText)
+                .withOpacity(0.5 * lineOpacity * highlightMultiplier)
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.0;
+            ..strokeWidth = isSelected ? 2.0 : 1.0;
           
           // 连接到右侧信息区域
           final infoPosition = Offset(size.width - 80, 50 + i * 40);
           canvas.drawLine(position, infoPosition, linePaint);
           
+          // 计算文字尺寸以自适应背景框 - 显示高级肤色信息
+          final colorInfo = isSelected
+              ? '${result.skinCategory}\n'
+              '${result.warmCoolType}\n'
+              '${result.colorBias}\n'
+              '${result.hexValue}\n'
+              'Confidence: ${(result.confidence * 100).toStringAsFixed(0)}%'
+              : '${result.skinCategory}\n${result.warmCoolType}';
+
+          
+          final textPainter = TextPainter(
+            text: TextSpan(
+              text: colorInfo,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: isSelected ? 10 : 11,
+                fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                height: 1.3,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+            textAlign: TextAlign.center,
+          );
+          textPainter.layout();
+          
+          // 自适应宽度：文字宽度 + 颜色块宽度 + 间距
+          final adaptiveWidth = textPainter.width + 35 + 16; // 35是颜色块和间距，16是左右padding
+          final adaptiveHeight = Math.max(32.0, textPainter.height + 12);
+          
           // 绘制颜色信息背景
           final infoBgPaint = Paint()
-            ..color = Colors.black.withOpacity(0.7 * lineOpacity)
+            ..color = (isSelected ? MorandiTheme.accentPink : Colors.black)
+                .withOpacity(bgOpacity * lineOpacity)
             ..style = PaintingStyle.fill;
           
           final infoRect = Rect.fromCenter(
             center: infoPosition,
-            width: 160,
-            height: 32,
+            width: adaptiveWidth,
+            height: adaptiveHeight,
           );
+          
+          // 高亮时添加外发光效果
+          if (isSelected) {
+            final glowPaint = Paint()
+              ..color = MorandiTheme.accentPink.withOpacity(0.3 * lineOpacity)
+              ..style = PaintingStyle.fill
+              ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
+            
+            canvas.drawRRect(
+              RRect.fromRectAndRadius(infoRect.inflate(4), const Radius.circular(20)),
+              glowPaint,
+            );
+          }
           
           canvas.drawRRect(
             RRect.fromRectAndRadius(infoRect, const Radius.circular(16)),
@@ -2622,10 +3199,11 @@ class AnalysisPainter extends CustomPainter {
             ..color = color.withOpacity(lineOpacity)
             ..style = PaintingStyle.fill;
           
+          final colorBlockSize = isSelected ? 22.0 : 20.0;
           final colorBlockRect = Rect.fromCenter(
-            center: Offset(infoPosition.dx - 55, infoPosition.dy),
-            width: 20,
-            height: 20,
+            center: Offset(infoPosition.dx - adaptiveWidth/2 + 18, infoPosition.dy),
+            width: colorBlockSize,
+            height: colorBlockSize,
           );
           
           canvas.drawRRect(
@@ -2637,16 +3215,23 @@ class AnalysisPainter extends CustomPainter {
           final colorBlockBorderPaint = Paint()
             ..color = Colors.white.withOpacity(0.8 * lineOpacity)
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.0;
+            ..strokeWidth = isSelected ? 2.0 : 1.0;
           
           canvas.drawRRect(
             RRect.fromRectAndRadius(colorBlockRect, const Radius.circular(4)),
             colorBlockBorderPaint,
           );
           
-          // 绘制颜色信息文字（调整位置以适应颜色块）
-          final colorInfo = result.toneType;
-          _drawText(canvas, colorInfo, Offset(infoPosition.dx - 15, infoPosition.dy), Colors.white.withOpacity(lineOpacity));
+          // 绘制颜色信息文字
+          final textPosition = Offset(
+            infoPosition.dx - adaptiveWidth/2 + 35 + textPainter.width/2, 
+            infoPosition.dy
+          );
+          
+          textPainter.paint(
+            canvas, 
+            textPosition - Offset(textPainter.width/2, textPainter.height/2)
+          );
         }
       }
     }

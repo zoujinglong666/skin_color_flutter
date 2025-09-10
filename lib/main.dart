@@ -145,6 +145,12 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   late AnimationController _scaleController;
   late AnimationController _rectAnimationController;
   late AnimationController _handleAnimationController;
+  late AnimationController _scanAnimationController;
+  late AnimationController _colorPointAnimationController;
+  
+  // 智能分析相关
+  List<Map<String, dynamic>> _smartAnalysisPoints = [];
+  bool _isShowingScanAnimation = false;
   
   @override
   void initState() {
@@ -165,6 +171,14 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       duration: const Duration(milliseconds: 100),
       vsync: this,
     );
+    _scanAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    );
+    _colorPointAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
   }
 
   @override
@@ -173,6 +187,8 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     _scaleController.dispose();
     _rectAnimationController.dispose();
     _handleAnimationController.dispose();
+    _scanAnimationController.dispose();
+    _colorPointAnimationController.dispose();
     super.dispose();
   }
 
@@ -312,6 +328,35 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     });
   }
 
+  /// 带动画效果的智能分析
+  Future<void> _startSmartAnalysisWithAnimation() async {
+    if (_selectedImage == null) return;
+    
+    setState(() {
+      _isShowingScanAnimation = true;
+      _smartAnalysisPoints.clear();
+    });
+    
+    // 启动扫描动画
+    _scanAnimationController.reset();
+    _scanAnimationController.forward();
+    
+    // 等待扫描动画完成一半后开始实际分析
+    await Future.delayed(const Duration(milliseconds: 1000));
+    
+    // 执行智能分析
+    await _performSmartAnalysis();
+    
+    // 扫描完成，显示颜色指示点
+    setState(() {
+      _isShowingScanAnimation = false;
+    });
+    
+    // 启动颜色点出现动画
+    _colorPointAnimationController.reset();
+    _colorPointAnimationController.forward();
+  }
+
   /// 智能分析模式 - 分析图片唯一主色 (升级版)
   Future<void> _performSmartAnalysis() async {
     if (_selectedImage == null || _imageSize == null) return;
@@ -416,18 +461,58 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
           selectedColor = _extractDominantColor(allSamples);
         }
         
-        // 显示分析结果
-        if (selectedColor != null && _displaySize != null) {
-          final centerPoint = Offset(
-            _displaySize!.width / 2,
-            _displaySize!.height / 2,
-          );
+        // 生成智能分析的颜色指示点
+        if (_displaySize != null && regionAnalysis.isNotEmpty) {
+          _smartAnalysisPoints.clear();
           
-          final result = _analyzeSkinTone(selectedColor, centerPoint, regionDescription);
+          // 选择最具代表性的几个区域作为指示点
+          final sortedRegions = regionAnalysis.entries.toList()
+            ..sort((a, b) => (b.value['count'] as int).compareTo(a.value['count'] as int));
           
-          setState(() {
-            _analysisResults.add(result);
-          });
+          // 最多显示5个指示点
+          final maxPoints = Math.min(5, sortedRegions.length);
+          
+          for (int i = 0; i < maxPoints; i++) {
+            final regionKey = sortedRegions[i].key;
+            final regionData = sortedRegions[i].value;
+            final color = regionData['color'] as Color;
+            
+            // 计算区域在显示坐标系中的位置
+            final regionCoords = regionKey.split('-');
+            final regionX = int.parse(regionCoords[0]);
+            final regionY = int.parse(regionCoords[1]);
+            
+            final displayX = (regionX + 0.5) * _displaySize!.width / 3;
+            final displayY = (regionY + 0.5) * _displaySize!.height / 3;
+            
+            final position = Offset(displayX, displayY);
+            
+            // 分析颜色特征
+            final result = _analyzeSkinTone(color, position, '区域 ${i + 1}');
+            
+            _smartAnalysisPoints.add({
+              'position': position,
+              'color': color,
+              'result': result,
+              'regionKey': regionKey,
+              'sampleCount': regionData['count'],
+              'isSkinTone': regionData['isSkinTone'],
+            });
+          }
+          
+          // 如果有主要的肤色区域，也添加到分析结果中
+          if (selectedColor != null) {
+            final centerPoint = Offset(
+              _displaySize!.width / 2,
+              _displaySize!.height / 2,
+            );
+            
+            final result = _analyzeSkinTone(selectedColor, centerPoint, regionDescription);
+            
+            setState(() {
+              _analysisResults.add(result);
+            });
+          }
         }
       }
     } catch (e) {
@@ -909,6 +994,22 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
           setState(() {
             _isDraggingHandle = true;
             _draggingHandleIndex = handleIndex;
+          });
+          return;
+        }
+        
+        // 检查是否点击在现有矩形区域内
+        if (existingRect.contains(localPosition)) {
+          // 点击在矩形内，不做任何操作（保持选择状态）
+          return;
+        } else {
+          // 点击在矩形外的空白处，取消选择
+          HapticFeedback.lightImpact(); // 取消选择的触觉反馈
+          setState(() {
+            _rectStartPoint = null;
+            _currentDragPoint = null;
+            _isHoveringHandle = false;
+            _hoveringHandleIndex = null;
           });
           return;
         }
@@ -1492,9 +1593,23 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             // 根据模式执行相应的分析
             if (_selectedImage != null) {
               if (mode == AnalysisMode.faceDetection) {
+                // 切换到人脸模式，清除智能分析数据
+                _smartAnalysisPoints.clear();
                 _performFaceDetection();
               } else if (mode == AnalysisMode.smartAnalysis) {
-                _performSmartAnalysis();
+                // 切换到智能模式，清除人脸检测数据并启动扫描动画
+                _detectedFaces.clear();
+                _rectStartPoint = null;
+                _currentDragPoint = null;
+                _startSmartAnalysisWithAnimation();
+              } else {
+                // 切换到手动模式，清除所有检测数据
+                _detectedFaces.clear();
+                _smartAnalysisPoints.clear();
+                if (mode == AnalysisMode.manualRect) {
+                  _rectStartPoint = null;
+                  _currentDragPoint = null;
+                }
               }
             }
           },
@@ -1698,7 +1813,12 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                         // Canvas绘制层
                         Positioned.fill(
                           child: AnimatedBuilder(
-                            animation: Listenable.merge([_rectAnimationController, _handleAnimationController]),
+                            animation: Listenable.merge([
+                              _rectAnimationController, 
+                              _handleAnimationController,
+                              _scanAnimationController,
+                              _colorPointAnimationController,
+                            ]),
                             builder: (context, child) {
                               return CustomPaint(
                                 painter: AnalysisPainter(
@@ -1715,6 +1835,10 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                                   analysisMode: _analysisMode,
                                   rectAnimation: _rectAnimationController,
                                   handleAnimation: _handleAnimationController,
+                                  scanAnimation: _scanAnimationController,
+                                  colorPointAnimation: _colorPointAnimationController,
+                                  smartAnalysisPoints: _smartAnalysisPoints,
+                                  isShowingScanAnimation: _isShowingScanAnimation,
                                 ),
                               );
                             },
@@ -1969,6 +2093,10 @@ class AnalysisPainter extends CustomPainter {
   final AnalysisMode analysisMode;
   final Animation<double>? rectAnimation;
   final Animation<double>? handleAnimation;
+  final Animation<double>? scanAnimation;
+  final Animation<double>? colorPointAnimation;
+  final List<Map<String, dynamic>> smartAnalysisPoints;
+  final bool isShowingScanAnimation;
 
   AnalysisPainter({
     required this.detectedFaces,
@@ -1984,6 +2112,10 @@ class AnalysisPainter extends CustomPainter {
     required this.analysisMode,
     this.rectAnimation,
     this.handleAnimation,
+    this.scanAnimation,
+    this.colorPointAnimation,
+    this.smartAnalysisPoints = const [],
+    this.isShowingScanAnimation = false,
   });
 
   @override
@@ -2064,47 +2196,15 @@ class AnalysisPainter extends CustomPainter {
       }
     }
 
-    // 绘制智能分析模式的扫描效果
+    // 绘制智能分析模式的效果
     if (analysisMode == AnalysisMode.smartAnalysis) {
-      final scanPaint = Paint()
-        ..color = MorandiTheme.neutralTone.withOpacity(0.4)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0;
-
-      final scanFillPaint = Paint()
-        ..color = MorandiTheme.neutralTone.withOpacity(0.05)
-        ..style = PaintingStyle.fill;
-
-      // 绘制全图扫描网格
-      final gridSize = 40.0;
-      for (double x = 0; x < size.width; x += gridSize) {
-        for (double y = 0; y < size.height; y += gridSize) {
-          final rect = Rect.fromLTWH(x, y, gridSize, gridSize);
-          canvas.drawRect(rect, scanFillPaint);
-        }
+      if (isShowingScanAnimation && scanAnimation != null) {
+        // 绘制扫描动画
+        _drawScanAnimation(canvas, size, scanAnimation!);
+      } else {
+        // 绘制颜色指示点
+        _drawSmartAnalysisPoints(canvas, size);
       }
-      
-      // 绘制边框
-      canvas.drawRect(
-        Rect.fromLTWH(0, 0, size.width, size.height),
-        scanPaint,
-      );
-      
-      // 绘制中心标记
-      final center = Offset(size.width / 2, size.height / 2);
-      canvas.drawCircle(
-        center,
-        20,
-        Paint()..color = MorandiTheme.neutralTone.withOpacity(0.3)..style = PaintingStyle.fill,
-      );
-      canvas.drawCircle(
-        center,
-        20,
-        Paint()..color = MorandiTheme.neutralTone..style = PaintingStyle.stroke..strokeWidth = 2,
-      );
-      
-      // 绘制智能分析标签
-      _drawText(canvas, '智能主色提取', Offset(size.width / 2, 25), MorandiTheme.primaryText);
     }
 
     // 绘制框选区域
@@ -2333,6 +2433,167 @@ class AnalysisPainter extends CustomPainter {
         corner + dirs[1] * indicatorLength,
         indicatorPaint,
       );
+    }
+  }
+
+  /// 绘制扫描动画
+  void _drawScanAnimation(Canvas canvas, Size size, Animation<double> animation) {
+    final progress = animation.value;
+    
+    // 扫描线效果
+    final scanLinePaint = Paint()
+      ..color = MorandiTheme.coolTone.withOpacity(0.8)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0
+      ..shader = ui.Gradient.linear(
+        Offset(0, 0),
+        Offset(size.width, 0),
+        [
+          MorandiTheme.coolTone.withOpacity(0.0),
+          MorandiTheme.coolTone.withOpacity(0.8),
+          MorandiTheme.coolTone.withOpacity(0.0),
+        ],
+        [0.0, 0.5, 1.0],
+      );
+    
+    // 垂直扫描线
+    final scanY = size.height * progress;
+    canvas.drawLine(
+      Offset(0, scanY),
+      Offset(size.width, scanY),
+      scanLinePaint,
+    );
+    
+    // 网格扫描效果
+    final gridPaint = Paint()
+      ..color = MorandiTheme.neutralTone.withOpacity(0.3 * progress)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0;
+    
+    final gridSize = 30.0;
+    final scannedHeight = size.height * progress;
+    
+    // 绘制已扫描区域的网格
+    for (double x = 0; x <= size.width; x += gridSize) {
+      canvas.drawLine(
+        Offset(x, 0),
+        Offset(x, scannedHeight),
+        gridPaint,
+      );
+    }
+    
+    for (double y = 0; y <= scannedHeight; y += gridSize) {
+      canvas.drawLine(
+        Offset(0, y),
+        Offset(size.width, y),
+        gridPaint,
+      );
+    }
+    
+    // 扫描进度文字
+    final progressText = '扫描中... ${(progress * 100).toInt()}%';
+    _drawText(canvas, progressText, Offset(size.width / 2, scanY - 30), MorandiTheme.primaryText);
+    
+    // 扫描光晕效果
+    final glowPaint = Paint()
+      ..color = MorandiTheme.coolTone.withOpacity(0.2)
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
+    
+    canvas.drawRect(
+      Rect.fromLTWH(0, scanY - 5, size.width, 10),
+      glowPaint,
+    );
+  }
+
+  /// 绘制智能分析颜色指示点
+  void _drawSmartAnalysisPoints(Canvas canvas, Size size) {
+    if (smartAnalysisPoints.isEmpty) return;
+    
+    final animationValue = colorPointAnimation?.value ?? 1.0;
+    
+    for (int i = 0; i < smartAnalysisPoints.length; i++) {
+      final point = smartAnalysisPoints[i];
+      final position = point['position'] as Offset;
+      final color = point['color'] as Color;
+      final result = point['result'] as SkinColorResult;
+      final isSkinTone = point['isSkinTone'] as bool;
+      
+      // 延迟动画，让指示点依次出现
+      final delayedAnimation = ((animationValue - (i * 0.1)).clamp(0.0, 1.0) / 0.9).clamp(0.0, 1.0);
+      
+      if (delayedAnimation > 0) {
+        // 指示点大小
+        final pointRadius = 12.0 * delayedAnimation;
+        final ringRadius = 20.0 * delayedAnimation;
+        
+        // 绘制外圈（呼吸效果）
+        final breathingScale = 1.0 + 0.2 * Math.sin(DateTime.now().millisecondsSinceEpoch / 500.0);
+        final outerRingPaint = Paint()
+          ..color = (isSkinTone ? MorandiTheme.warmTone : MorandiTheme.coolTone).withOpacity(0.3 * delayedAnimation)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0;
+        
+        canvas.drawCircle(position, ringRadius * breathingScale, outerRingPaint);
+        
+        // 绘制内圈填充
+        final innerFillPaint = Paint()
+          ..color = color.withOpacity(0.8 * delayedAnimation)
+          ..style = PaintingStyle.fill;
+        
+        canvas.drawCircle(position, pointRadius, innerFillPaint);
+        
+        // 绘制边框
+        final borderPaint = Paint()
+          ..color = Colors.white.withOpacity(delayedAnimation)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0;
+        
+        canvas.drawCircle(position, pointRadius, borderPaint);
+        
+        // 绘制颜色类型标签
+        final labelText = isSkinTone ? result.emoji : '🎨';
+        _drawText(canvas, labelText, position, Colors.white.withOpacity(delayedAnimation));
+        
+        // 绘制连接线到颜色信息
+        if (delayedAnimation > 0.5) {
+          final lineOpacity = (delayedAnimation - 0.5) * 2;
+          final linePaint = Paint()
+            ..color = MorandiTheme.secondaryText.withOpacity(0.5 * lineOpacity)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.0;
+          
+          // 连接到右侧信息区域
+          final infoPosition = Offset(size.width - 80, 50 + i * 40);
+          canvas.drawLine(position, infoPosition, linePaint);
+          
+          // 绘制颜色信息背景
+          final infoBgPaint = Paint()
+            ..color = Colors.black.withOpacity(0.7 * lineOpacity)
+            ..style = PaintingStyle.fill;
+          
+          final infoRect = Rect.fromCenter(
+            center: infoPosition,
+            width: 140,
+            height: 30,
+          );
+          
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(infoRect, const Radius.circular(15)),
+            infoBgPaint,
+          );
+          
+          // 绘制颜色信息文字
+          final colorInfo = '${result.toneType}';
+          _drawText(canvas, colorInfo, infoPosition, Colors.white.withOpacity(lineOpacity));
+        }
+      }
+    }
+    
+    // 绘制智能分析完成标签
+    if (animationValue > 0.8) {
+      final labelOpacity = (animationValue - 0.8) * 5;
+      _drawText(canvas, '✨ 智能色彩分析完成', Offset(size.width / 2, 30), MorandiTheme.primaryText.withOpacity(labelOpacity));
     }
   }
 

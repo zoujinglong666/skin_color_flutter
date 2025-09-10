@@ -16,7 +16,96 @@ enum AnalysisMode {
   manualPoint,   // 手动点击模式
   manualRect,    // 手动框选模式
 }
+/// 肤色类别
+class SkinToneCategory {
+  final String name;
+  final String tone;
+  final String emoji;
 
+  SkinToneCategory(this.name, this.tone, this.emoji);
+}
+
+class SkinToneThreshold {
+  final double minIta;
+  final String name;
+  final String tone;
+  final String emoji;
+
+  const SkinToneThreshold(this.minIta, this.name, this.tone, this.emoji);
+}
+
+class SkinToneClassifier {
+  static const _thresholds = [
+    SkinToneThreshold(55, '瓷白 · 透亮', '极浅亮调', '✨'),
+    SkinToneThreshold(41, '自然浅肤 · 清透', '浅亮调', '🌟'),
+    SkinToneThreshold(28, '均衡中性 · 健康', '中性调', '🌼'),
+    SkinToneThreshold(10, '阳光小麦 · 活力', '健康小麦调', '🌞'),
+    SkinToneThreshold(-30, '古铜健康 · 魅力', '古铜深调', '🌹'),
+  ];
+
+  static SkinToneCategory classify(double ita) {
+    for (final t in _thresholds) {
+      if (ita > t.minIta) return SkinToneCategory(t.name, t.tone, t.emoji);
+    }
+    return SkinToneCategory('浓郁深肤 · 高级', '深邃浓调', '🖤');
+  }
+}
+
+/// 冷暖色调分析
+class TemperatureAnalyzer {
+  static String analyze(double warmScore, double coolScore) {
+    if (warmScore > coolScore + 0.2) {
+      return '暖调 · 偏金感';
+    } else if (coolScore > warmScore + 0.2) {
+      return '冷调 · 偏粉感';
+    } else {
+      return '中性 · 百搭感';
+    }
+  }
+}
+
+/// 偏色分析
+class ColorBiasAnalyzer {
+  static String analyze(double a, double bLab) {
+    if (bLab > 15 && a > 5) {
+      return '带一点金色温感';
+    } else if (a > 10 && bLab < 10) {
+      return '透出红润粉嫩感';
+    } else if (a < 0) {
+      return '略带清冷绿感';
+    } else if (bLab < 0) {
+      return '轻微冷蓝感';
+    } else {
+      return '均衡自然感';
+    }
+  }
+}
+
+/// 高级指标构建
+class AdvancedMetricsBuilder {
+  static Map<String, String> build({
+    required double ita,
+    required double skinConfidence,
+    required double warmScore,
+    required double coolScore,
+    required double a,
+    required double bLab,
+    required double saturation,
+    required double value,
+    required double L,
+  }) {
+    return {
+      'ITA': ita.toStringAsFixed(2),
+      '肤色识别可信度': '${(skinConfidence * 100).toStringAsFixed(1)}%',
+      '暖感指数': '${(warmScore * 100).toStringAsFixed(1)}',
+      '冷感指数': '${(coolScore * 100).toStringAsFixed(1)}',
+      '色彩饱和度': Math.sqrt(a * a + bLab * bLab).toStringAsFixed(2),
+      '纯净度': '${(saturation * 100).toStringAsFixed(1)}',
+      '亮度感': '${(value * 100).toStringAsFixed(1)}',
+      '光学明度': L.toStringAsFixed(1),
+    };
+  }
+}
 /// 肤色分析结果数据类（进阶版）
 class SkinColorResult {
   final String id;
@@ -952,7 +1041,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     // 启动颜色点出现动画
     _colorPointAnimationController.reset();
     await _colorPointAnimationController.forward();
-    
+
     print('智能分析动画完成'); // 调试日志
   }
 
@@ -2245,124 +2334,80 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     );
   }
 
+
+
   /// 高级肤色分析算法 - 进阶版
   SkinColorResult _analyzeSkinTone(Color color, Offset position, String label) {
-    final r = color.red;
-    final g = color.green;
-    final b = color.blue;
-    
-    // 多色彩空间转换
-    final hsv = HSVColor.fromColor(color);
-    final labColor = ColorSpaceConverter.rgbToLab(r, g, b);
-    final ycbcrColor = ColorSpaceConverter.rgbToYCbCr(r, g, b);
-    
-    // 提取关键指标
-    final hue = hsv.hue;
-    final saturation = hsv.saturation;
-    final value = hsv.value;
-    final L = labColor[0]; // 明度
-    final a = labColor[1]; // 红绿轴
-    final b_lab = labColor[2]; // 黄蓝轴
-    final Y = ycbcrColor[0]; // 亮度
-    final Cb = ycbcrColor[1]; // 蓝色色度
-    final Cr = ycbcrColor[2]; // 红色色度
-    
-    // 计算肤色置信度
-    final skinConfidence = ColorSpaceConverter.calculateSkinConfidence(ycbcrColor);
-    
-    // ITA值计算 (Individual Typology Angle) - 专业肤色分类指标
-    final ITA = (Math.atan((L - 50) / b_lab) * 180 / Math.pi).toDouble();
-    
-    // 高级肤色分类逻辑
-    String skinCategory;
-    String toneType;
-    String warmCoolType;
-    String colorBias;
-    String emoji;
-    
-    // 基于ITA值和Lab空间的精确分类
-    if (ITA > 55) {
-      skinCategory = '白皙肤色';
-      toneType = '极浅色调';
-      emoji = '✨';
-    } else if (ITA > 41) {
-      skinCategory = '浅色肤色';
-      toneType = '浅色调';
-      emoji = '🌟';
-    } else if (ITA > 28) {
-      skinCategory = '中等肤色';
-      toneType = '中色调';
-      emoji = '🌼';
-    } else if (ITA > 10) {
-      skinCategory = '小麦肤色';
-      toneType = '深色调';
-      emoji = '🌞';
-    } else if (ITA > -30) {
-      skinCategory = '深色肤色';
-      toneType = '极深色调';
-      emoji = '🌹';
-    } else {
-      skinCategory = '极深肤色';
-      toneType = '超深色调';
-      emoji = '🖤';
-    }
-    
-    // 冷暖色调分析 - 基于多个指标的综合判断
-    final warmScore = _calculateWarmScore(hue, a, b_lab, Cr);
-    final coolScore = _calculateCoolScore(hue, a, b_lab, Cb);
-    
-    if (warmScore > coolScore + 0.2) {
-      warmCoolType = '暖色调';
-    } else if (coolScore > warmScore + 0.2) {
-      warmCoolType = '冷色调';
-    } else {
-      warmCoolType = '中性色调';
-    }
-    
-    // 偏色分析 - 基于Lab空间的a*和b*值
-    if (b_lab > 15 && a > 5) {
-      colorBias = '偏黄调';
-    } else if (a > 10 && b_lab < 10) {
-      colorBias = '偏粉调';
-    } else if (a < 0) {
-      colorBias = '偏绿调';
-    } else if (b_lab < 0) {
-      colorBias = '偏蓝调';
-    } else {
-      colorBias = '中性调';
-    }
-    
-    // 高级指标计算
-    final advancedMetrics = {
-      'ITA': ITA.toStringAsFixed(2),
-      'skinConfidence': (skinConfidence * 100).toStringAsFixed(1),
-      'warmScore': (warmScore * 100).toStringAsFixed(1),
-      'coolScore': (coolScore * 100).toStringAsFixed(1),
-      'chromaIntensity': Math.sqrt(a * a + b_lab * b_lab).toStringAsFixed(2),
-      'colorPurity': (saturation * 100).toStringAsFixed(1),
-      'brightness': (value * 100).toStringAsFixed(1),
-      'labLightness': L.toStringAsFixed(1),
-    };
-    
-    return SkinColorResult(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      position: position,
-      averageColor: color,
-      rgbValue: 'RGB($r, $g, $b)',
-      hsvValue: 'HSV(${hue.round()}°, ${(saturation * 100).round()}%, ${(value * 100).round()}%)',
-      hexValue: '#${color.value.toRadixString(16).substring(2).toUpperCase()}',
-      labValue: 'LAB(${L.toStringAsFixed(1)}, ${a.toStringAsFixed(1)}, ${b_lab.toStringAsFixed(1)})',
-      ycbcrValue: 'YCbCr(${Y.toStringAsFixed(0)}, ${Cb.toStringAsFixed(0)}, ${Cr.toStringAsFixed(0)})',
-      toneType: toneType,
-      warmCoolType: warmCoolType,
-      colorBias: colorBias,
-      skinCategory: skinCategory,
-      confidence: skinConfidence,
-      emoji: emoji,
-      createdAt: DateTime.now(),
-      advancedMetrics: advancedMetrics,
-    );
+  final r = color.red;
+  final g = color.green;
+  final b = color.blue;
+
+  // 色彩空间转换
+  final hsv = HSVColor.fromColor(color);
+  final labColor = ColorSpaceConverter.rgbToLab(r, g, b);
+  final ycbcrColor = ColorSpaceConverter.rgbToYCbCr(r, g, b);
+
+  // 指标
+  final hue = hsv.hue;
+  final saturation = hsv.saturation;
+  final value = hsv.value;
+  final L = labColor[0];
+  final a = labColor[1];
+  final bLab = labColor[2];
+  final Y = ycbcrColor[0];
+  final Cb = ycbcrColor[1];
+  final Cr = ycbcrColor[2];
+
+  // 置信度
+  final skinConfidence = ColorSpaceConverter.calculateSkinConfidence(ycbcrColor);
+
+  // ITA
+  final ita = (Math.atan((L - 50) / bLab) * 180 / Math.pi).toDouble();
+
+  // 分类
+  final skinCategory = SkinToneClassifier.classify(ita);
+
+  // 冷暖
+  final warmScore = _calculateWarmScore(hue, a, bLab, Cr);
+  final coolScore = _calculateCoolScore(hue, a, bLab, Cb);
+  final warmCoolType = TemperatureAnalyzer.analyze(warmScore, coolScore);
+
+  // 偏色
+  final colorBias = ColorBiasAnalyzer.analyze(a, bLab);
+
+  // 高级指标
+  final advancedMetrics = AdvancedMetricsBuilder.build(
+  ita: ita,
+  skinConfidence: skinConfidence,
+  warmScore: warmScore,
+  coolScore: coolScore,
+  a: a,
+  bLab: bLab,
+  saturation: saturation,
+  value: value,
+  L: L,
+  );
+
+  return SkinColorResult(
+  id: DateTime.now().millisecondsSinceEpoch.toString(),
+  position: position,
+  averageColor: color,
+  rgbValue: 'RGB($r, $g, $b)',
+  hsvValue: 'HSV(${hue.round()}°, ${(saturation * 100).round()}%, ${(value * 100).round()}%)',
+  hexValue: '#${color.value.toRadixString(16).substring(2).toUpperCase()}',
+  labValue: 'LAB(${L.toStringAsFixed(1)}, ${a.toStringAsFixed(1)}, ${bLab.toStringAsFixed(1)})',
+  ycbcrValue: 'YCbCr(${Y.toStringAsFixed(0)}, ${Cb.toStringAsFixed(0)}, ${Cr.toStringAsFixed(0)})',
+  toneType: skinCategory.tone,
+  warmCoolType: warmCoolType,
+  colorBias: colorBias,
+  skinCategory: skinCategory.name,
+  confidence: skinConfidence,
+  emoji: skinCategory.emoji,
+  createdAt: DateTime.now(),
+  advancedMetrics: advancedMetrics,
+  );
   }
+
   
   /// 计算暖色调评分
   double _calculateWarmScore(double hue, double a, double b_lab, double cr) {
@@ -2482,7 +2527,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     // 显示删除反馈和撤销选项
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('已删除颜色 ${removedItem.toString()}'),
+        content: Text('已删除颜色 ${removedItem.colorBias}'),
         duration: const Duration(seconds: 3),
         behavior: SnackBarBehavior.floating,
         action: SnackBarAction(
@@ -4201,7 +4246,10 @@ class AnalysisPainter extends CustomPainter {
   /// 绘制扫描动画
   void _drawScanAnimation(Canvas canvas, Size size, Animation<double> animation) {
     final progress = animation.value;
-    
+
+    // 扫描线位置
+    final scanY = size.height * progress;
+
     // 扫描线效果
     final scanLinePaint = Paint()
       ..color = MorandiTheme.coolTone.withOpacity(0.8)
@@ -4217,55 +4265,42 @@ class AnalysisPainter extends CustomPainter {
         ],
         [0.0, 0.5, 1.0],
       );
-    
-    // 垂直扫描线
-    final scanY = size.height * progress;
+
+    // 绘制横向扫描线
     canvas.drawLine(
       Offset(0, scanY),
       Offset(size.width, scanY),
       scanLinePaint,
     );
-    
+
     // 网格扫描效果
     final gridPaint = Paint()
       ..color = MorandiTheme.neutralTone.withOpacity(0.3 * progress)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
-    
+
     final gridSize = 30.0;
     final scannedHeight = size.height * progress;
-    
-    // 绘制已扫描区域的网格
+
+    // 已扫描区域网格
     for (double x = 0; x <= size.width; x += gridSize) {
-      canvas.drawLine(
-        Offset(x, 0),
-        Offset(x, scannedHeight),
-        gridPaint,
-      );
+      canvas.drawLine(Offset(x, 0), Offset(x, scannedHeight), gridPaint);
     }
-    
     for (double y = 0; y <= scannedHeight; y += gridSize) {
-      canvas.drawLine(
-        Offset(0, y),
-        Offset(size.width, y),
-        gridPaint,
-      );
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
     }
-    
+
     // 扫描进度文字
     final progressText = '扫描中... ${(progress * 100).toInt()}%';
     _drawText(canvas, progressText, Offset(size.width / 2, scanY - 30), MorandiTheme.primaryText);
-    
+
     // 扫描光晕效果
     final glowPaint = Paint()
       ..color = MorandiTheme.coolTone.withOpacity(0.2)
       ..style = PaintingStyle.fill
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
-    
-    canvas.drawRect(
-      Rect.fromLTWH(0, scanY - 5, size.width, 10),
-      glowPaint,
-    );
+
+    canvas.drawRect(Rect.fromLTWH(0, scanY - 5, size.width, 10), glowPaint);
   }
 
   /// 绘制智能分析颜色指示点
@@ -4277,12 +4312,14 @@ class AnalysisPainter extends CustomPainter {
     for (int i = 0; i < smartAnalysisPoints.length; i++) {
       final point = smartAnalysisPoints[i];
       var position = point['position'] as Offset;
-      final color = point['color'] as Color;
       final result = point['result'] as SkinColorResult;
       final isSkinTone = point['isSkinTone'] as bool;
-      
+
+      // ✅ 统一用 result.hexValue 取色
+      final color = Color(int.parse(result.hexValue.replaceFirst('#', '0xff')));
+
       // 应用拖拽偏移
-      final regionIndex = i + 1; // 智能分析点索引从1开始
+      final regionIndex = i + 1;
       if (isDraggingRegion && draggingRegionIndex == regionIndex && dragOffset != null) {
         position = position + dragOffset!;
       }
@@ -4325,9 +4362,9 @@ class AnalysisPainter extends CustomPainter {
         
         canvas.drawCircle(position, pointRadius, borderPaint);
         
-        // 绘制颜色类型标签
-        final labelText = isSkinTone ? result.emoji : '🎨';
-        _drawText(canvas, labelText, position, Colors.white.withOpacity(delayedAnimation));
+        // // 绘制颜色类型标签
+        // final labelText = isSkinTone ? result.emoji : '🎨';
+        // _drawText(canvas, labelText, position, Colors.white.withOpacity(delayedAnimation));
         
         // 绘制连接线到颜色信息
         if (delayedAnimation > 0.5) {
@@ -4350,6 +4387,11 @@ class AnalysisPainter extends CustomPainter {
           
           // 计算文字尺寸以自适应背景框 - 显示高级肤色信息
           final colorInfo = isSelected
+              ? '${result.skinCategory}\n'
+              '${result.warmCoolType}\n'
+              '${result.colorBias}\n'
+              : '${result.skinCategory}\n${result.warmCoolType}';
+          final colorInfoTemp = isSelected
               ? '${result.skinCategory}\n'
               '${result.warmCoolType}\n'
               '${result.colorBias}\n'

@@ -1,6 +1,6 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as Math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -495,6 +495,14 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   bool _isHoveringHandle = false;
   int? _hoveringHandleIndex;
   
+  // 长按拖拽相关
+  bool _isLongPressing = false;
+  bool _isDraggingRegion = false;
+  Offset? _longPressStartPoint;
+  Offset? _dragOffset;
+  int? _draggingRegionIndex; // 正在拖拽的区域索引
+  Timer? _longPressTimer;
+  
   // 动画控制器
   late AnimationController _fadeController;
   late AnimationController _scaleController;
@@ -507,6 +515,15 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   List<Map<String, dynamic>> _smartAnalysisPoints = [];
   bool _isShowingScanAnimation = false;
   int? _selectedColorPointIndex; // 选中的颜色指示点索引
+  
+  // 人脸轮廓动画相关
+  late AnimationController _faceContourAnimationController;
+  late Animation<double> _faceContourAnimation;
+  late AnimationController _landmarkAnimationController;
+  late Animation<double> _landmarkAnimation;
+  bool _showFaceContours = false;
+  List<Map<String, dynamic>> _faceContourPaths = [];
+  bool _isDrawingContours = false;
   
   @override
   void initState() {
@@ -535,6 +552,32 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       duration: const Duration(milliseconds: 800),
       vsync: this,
     );
+    
+    // 人脸轮廓动画控制器
+    _faceContourAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
+      vsync: this,
+    );
+    _faceContourAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _faceContourAnimationController,
+      curve: Curves.easeInOut,
+    ));
+    
+    // 关键点动画控制器
+    _landmarkAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 800),
+      vsync: this,
+    );
+    _landmarkAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(
+      parent: _landmarkAnimationController,
+      curve: Curves.elasticOut,
+    ));
   }
 
   @override
@@ -545,6 +588,9 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     _handleAnimationController.dispose();
     _scanAnimationController.dispose();
     _colorPointAnimationController.dispose();
+    _faceContourAnimationController.dispose();
+    _landmarkAnimationController.dispose();
+    _longPressTimer?.cancel();
     super.dispose();
   }
 
@@ -620,11 +666,14 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   }
 
   /// 自动人脸检测并分析脸颊区域
+  /// 执行人脸检测 - 增强版（包含轮廓动画）
   Future<void> _performFaceDetection() async {
     if (_selectedImage == null) return;
     
     setState(() {
       _isAnalyzing = true;
+      _showFaceContours = false;
+      _faceContourPaths.clear();
     });
 
     try {
@@ -633,6 +682,8 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         options: FaceDetectorOptions(
           enableContours: true,
           enableLandmarks: true,
+          enableClassification: true,
+          enableTracking: true,
         ),
       );
 
@@ -643,6 +694,17 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       });
       
       if (faces.isNotEmpty && _analysisMode == AnalysisMode.faceDetection) {
+        // 生成人脸轮廓路径数据
+        await _generateFaceContourPaths(faces);
+        
+        setState(() {
+          _showFaceContours = true;
+          _isDrawingContours = true;
+        });
+        
+        // 启动轮廓绘制动画
+        await _startFaceContourAnimation();
+        
         // 检测到人脸，进行脸颊分析
         final face = faces.first;
         final boundingBox = face.boundingBox;
@@ -668,7 +730,6 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         setState(() {
           _analysisMode = AnalysisMode.smartAnalysis;
         });
-        
         // 执行智能色调分析
         await _performSmartAnalysis();
       }
@@ -686,6 +747,171 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     setState(() {
       _isAnalyzing = false;
     });
+  }
+
+  /// 生成人脸轮廓路径数据
+  Future<void> _generateFaceContourPaths(List<Face> faces) async {
+    _faceContourPaths.clear();
+    
+    for (int faceIndex = 0; faceIndex < faces.length; faceIndex++) {
+      final face = faces[faceIndex];
+      final contourPaths = <Map<String, dynamic>>[];
+      
+      // 面部轮廓
+      if (face.contours[FaceContourType.face] != null) {
+        final faceContour = face.contours[FaceContourType.face]!;
+        contourPaths.add({
+          'type': 'face_outline',
+          'points': faceContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.cyan.withOpacity(0.8),
+          'strokeWidth': 2.5,
+          'animationDelay': 0,
+        });
+      }
+      
+      // 左眼轮廓
+      if (face.contours[FaceContourType.leftEye] != null) {
+        final leftEyeContour = face.contours[FaceContourType.leftEye]!;
+        contourPaths.add({
+          'type': 'left_eye',
+          'points': leftEyeContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.lightBlueAccent.withOpacity(0.9),
+          'strokeWidth': 2.0,
+          'animationDelay': 300,
+        });
+      }
+      
+      // 右眼轮廓
+      if (face.contours[FaceContourType.rightEye] != null) {
+        final rightEyeContour = face.contours[FaceContourType.rightEye]!;
+        contourPaths.add({
+          'type': 'right_eye',
+          'points': rightEyeContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.lightBlueAccent.withOpacity(0.9),
+          'strokeWidth': 2.0,
+          'animationDelay': 300,
+        });
+      }
+      
+      // 鼻子轮廓
+      if (face.contours[FaceContourType.noseBridge] != null) {
+        final noseBridgeContour = face.contours[FaceContourType.noseBridge]!;
+        contourPaths.add({
+          'type': 'nose_bridge',
+          'points': noseBridgeContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.tealAccent.withOpacity(0.8),
+          'strokeWidth': 1.8,
+          'animationDelay': 600,
+        });
+      }
+      
+      if (face.contours[FaceContourType.noseBottom] != null) {
+        final noseBottomContour = face.contours[FaceContourType.noseBottom]!;
+        contourPaths.add({
+          'type': 'nose_bottom',
+          'points': noseBottomContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.tealAccent.withOpacity(0.8),
+          'strokeWidth': 1.8,
+          'animationDelay': 700,
+        });
+      }
+      
+      // 嘴巴轮廓
+      if (face.contours[FaceContourType.upperLipTop] != null) {
+        final upperLipContour = face.contours[FaceContourType.upperLipTop]!;
+        contourPaths.add({
+          'type': 'upper_lip',
+          'points': upperLipContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.pinkAccent.withOpacity(0.8),
+          'strokeWidth': 2.0,
+          'animationDelay': 900,
+        });
+      }
+      
+      if (face.contours[FaceContourType.lowerLipBottom] != null) {
+        final lowerLipContour = face.contours[FaceContourType.lowerLipBottom]!;
+        contourPaths.add({
+          'type': 'lower_lip',
+          'points': lowerLipContour.points.map((point) => Offset(point.x.toDouble(), point.y.toDouble())).toList(),
+          'color': Colors.pinkAccent.withOpacity(0.8),
+          'strokeWidth': 2.0,
+          'animationDelay': 1000,
+        });
+      }
+      
+      // 添加关键点
+      final landmarks = <Map<String, dynamic>>[];
+      if (face.landmarks[FaceLandmarkType.leftEye] != null) {
+        landmarks.add({
+          'type': 'left_eye_center',
+          'position': face.landmarks[FaceLandmarkType.leftEye]!.position,
+          'color': Colors.yellowAccent,
+          'size': 4.0,
+          'animationDelay': 1200,
+        });
+      }
+      
+      if (face.landmarks[FaceLandmarkType.rightEye] != null) {
+        landmarks.add({
+          'type': 'right_eye_center',
+          'position': face.landmarks[FaceLandmarkType.rightEye]!.position,
+          'color': Colors.yellowAccent,
+          'size': 4.0,
+          'animationDelay': 1200,
+        });
+      }
+      
+      if (face.landmarks[FaceLandmarkType.noseBase] != null) {
+        landmarks.add({
+          'type': 'nose_base',
+          'position': face.landmarks[FaceLandmarkType.noseBase]!.position,
+          'color': Colors.orangeAccent,
+          'size': 3.5,
+          'animationDelay': 1400,
+        });
+      }
+      
+      if (face.landmarks[FaceLandmarkType.bottomMouth] != null) {
+        landmarks.add({
+          'type': 'mouth_center',
+          'position': face.landmarks[FaceLandmarkType.bottomMouth]!.position,
+          'color': Colors.redAccent,
+          'size': 3.5,
+          'animationDelay': 1600,
+        });
+      }
+      
+      _faceContourPaths.add({
+        'faceIndex': faceIndex,
+        'boundingBox': face.boundingBox,
+        'contours': contourPaths,
+        'landmarks': landmarks,
+      });
+    }
+  }
+  
+  /// 启动人脸轮廓动画
+  Future<void> _startFaceContourAnimation() async {
+    // 重置动画
+    _faceContourAnimationController.reset();
+    _landmarkAnimationController.reset();
+    
+    // 启动轮廓动画
+    _faceContourAnimationController.forward();
+    
+    // 延迟启动关键点动画
+    await Future.delayed(const Duration(milliseconds: 800));
+    if (mounted) {
+      _landmarkAnimationController.forward();
+    }
+    
+    // 动画完成后的处理
+    await Future.delayed(const Duration(milliseconds: 1200));
+    if (mounted) {
+      setState(() {
+        _isDrawingContours = false;
+      });
+    }
   }
 
   /// 带动画效果的智能分析
@@ -1505,6 +1731,37 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     }
   }
 
+  /// 处理拖拽开始事件
+  void _onPanStart(DragStartDetails details) {
+    if (_selectedImage == null) return;
+
+    final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null) return;
+
+    final localPosition = renderBox.globalToLocal(details.globalPosition);
+    
+    // 检查是否在已选择的区域上开始拖拽
+    final regionIndex = _getRegionIndexAtPosition(localPosition);
+    
+    if (regionIndex != null) {
+      // 启动长按定时器
+      _longPressTimer?.cancel();
+      _longPressTimer = Timer(const Duration(milliseconds: 300), () {
+        if (mounted) {
+          HapticFeedback.heavyImpact();
+          setState(() {
+            _isLongPressing = true;
+            _isDraggingRegion = true;
+            _longPressStartPoint = localPosition;
+            _draggingRegionIndex = regionIndex;
+            _dragOffset = Offset.zero;
+          });
+          _handleAnimationController.forward();
+        }
+      });
+    }
+  }
+
   /// 处理拖拽更新事件
   void _onPanUpdate(DragUpdateDetails details) {
     if (_selectedImage == null) return;
@@ -1513,6 +1770,28 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     if (renderBox == null) return;
 
     final localPosition = renderBox.globalToLocal(details.globalPosition);
+    
+    // 处理长按拖拽
+    if (_isDraggingRegion && _draggingRegionIndex != null && _longPressStartPoint != null) {
+      // 取消长按定时器（如果还在运行）
+      _longPressTimer?.cancel();
+      
+      // 计算拖拽偏移量
+      final newOffset = localPosition - _longPressStartPoint!;
+      
+      // 边界检查，确保拖拽后的区域不超出图片范围
+      final clampedOffset = _clampDragOffset(newOffset, _draggingRegionIndex!);
+      
+      setState(() {
+        _dragOffset = clampedOffset;
+      });
+      
+      // 轻微的触觉反馈
+      if ((newOffset - (_dragOffset ?? Offset.zero)).distance > 10) {
+        HapticFeedback.selectionClick();
+      }
+      return;
+    }
     
     // 边界检查，确保拖拽不超出图片范围
     final clampedPosition = Offset(
@@ -1612,6 +1891,209 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   Future<void> _analyzeRectRegion(Rect rect) async {
     final center = rect.center;
     await _analyzeSkinColorAtPoint(center, '框选区域 ${_analysisResults.length + 1}');
+  }
+
+  /// 长按开始事件处理
+  void _onLongPressStart(LongPressStartDetails details) {
+    if (_selectedImage == null) return;
+
+    final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null) return;
+
+    final localPosition = renderBox.globalToLocal(details.globalPosition);
+    
+    // 检查是否长按在已选择的区域上
+    final regionIndex = _getRegionIndexAtPosition(localPosition);
+    
+    if (regionIndex != null) {
+      HapticFeedback.heavyImpact(); // 长按触觉反馈
+      
+      setState(() {
+        _isLongPressing = true;
+        _isDraggingRegion = true;
+        _longPressStartPoint = localPosition;
+        _draggingRegionIndex = regionIndex;
+        _dragOffset = Offset.zero;
+      });
+      
+      // 播放长按动画效果
+      _handleAnimationController.forward();
+    }
+  }
+
+  /// 长按拖拽移动事件处理
+  void _onLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
+    if (!_isDraggingRegion || _draggingRegionIndex == null || _longPressStartPoint == null) return;
+
+    final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null) return;
+
+    final localPosition = renderBox.globalToLocal(details.globalPosition);
+    
+    // 计算拖拽偏移量
+    final newOffset = localPosition - _longPressStartPoint!;
+    
+    // 边界检查，确保拖拽后的区域不超出图片范围
+    final clampedOffset = _clampDragOffset(newOffset, _draggingRegionIndex!);
+    
+    setState(() {
+      _dragOffset = clampedOffset;
+    });
+    
+    // 轻微的触觉反馈
+    if ((newOffset - (_dragOffset ?? Offset.zero)).distance > 10) {
+      HapticFeedback.selectionClick();
+    }
+  }
+
+  /// 长按拖拽结束事件处理
+  void _onLongPressEnd(LongPressEndDetails details) {
+    if (!_isDraggingRegion || _draggingRegionIndex == null || _dragOffset == null) return;
+
+    HapticFeedback.mediumImpact(); // 拖拽结束触觉反馈
+    
+    // 应用拖拽偏移到实际的区域位置
+    _applyDragOffsetToRegion(_draggingRegionIndex!, _dragOffset!);
+    
+    setState(() {
+      _isLongPressing = false;
+      _isDraggingRegion = false;
+      _longPressStartPoint = null;
+      _draggingRegionIndex = null;
+      _dragOffset = null;
+    });
+    
+    _handleAnimationController.reverse();
+  }
+
+  /// 获取指定位置的区域索引
+  int? _getRegionIndexAtPosition(Offset position) {
+    // 检查框选区域
+    if (_rectStartPoint != null && _currentDragPoint != null) {
+      final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+      if (rect.contains(position)) {
+        return 0; // 框选区域索引为0
+      }
+    }
+    
+    // 检查智能分析点
+    for (int i = 0; i < _smartAnalysisPoints.length; i++) {
+      final point = _smartAnalysisPoints[i];
+      final pointPosition = point['position'] as Offset;
+      final distance = (position - pointPosition).distance;
+      
+      if (distance <= 20) { // 20像素的点击范围
+        return i + 1; // 智能分析点索引从1开始
+      }
+    }
+    
+    // 检查手动点击的分析结果
+    for (int i = 0; i < _analysisResults.length; i++) {
+      final result = _analysisResults[i];
+      final distance = (position - result.position).distance;
+      
+      if (distance <= 20) { // 20像素的点击范围
+        return i + 100; // 手动点击结果索引从100开始，避免冲突
+      }
+    }
+    
+    return null;
+  }
+
+  /// 限制拖拽偏移量，确保不超出图片边界
+  Offset _clampDragOffset(Offset offset, int regionIndex) {
+    if (_displaySize == null) return offset;
+    
+    final bounds = _displaySize!;
+    
+    if (regionIndex == 0) {
+      // 框选区域的边界检查
+      if (_rectStartPoint != null && _currentDragPoint != null) {
+        final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+        final newRect = rect.translate(offset.dx, offset.dy);
+        
+        double clampedDx = offset.dx;
+        double clampedDy = offset.dy;
+        
+        if (newRect.left < 0) clampedDx = -rect.left;
+        if (newRect.right > bounds.width) clampedDx = bounds.width - rect.right;
+        if (newRect.top < 0) clampedDy = -rect.top;
+        if (newRect.bottom > bounds.height) clampedDy = bounds.height - rect.bottom;
+        
+        return Offset(clampedDx, clampedDy);
+      }
+    } else if (regionIndex > 0 && regionIndex <= _smartAnalysisPoints.length) {
+      // 智能分析点的边界检查
+      final pointIndex = regionIndex - 1;
+      final point = _smartAnalysisPoints[pointIndex];
+      final originalPosition = point['position'] as Offset;
+      final newPosition = originalPosition + offset;
+      
+      final clampedPosition = Offset(
+        newPosition.dx.clamp(0.0, bounds.width),
+        newPosition.dy.clamp(0.0, bounds.height),
+      );
+      
+      return clampedPosition - originalPosition;
+    } else if (regionIndex >= 100) {
+      // 手动点击结果的边界检查
+      final resultIndex = regionIndex - 100;
+      if (resultIndex < _analysisResults.length) {
+        final result = _analysisResults[resultIndex];
+        final newPosition = result.position + offset;
+        
+        final clampedPosition = Offset(
+          newPosition.dx.clamp(0.0, bounds.width),
+          newPosition.dy.clamp(0.0, bounds.height),
+        );
+        
+        return clampedPosition - result.position;
+      }
+    }
+    
+    return offset;
+  }
+
+  /// 应用拖拽偏移到实际区域
+  void _applyDragOffsetToRegion(int regionIndex, Offset offset) {
+    if (regionIndex == 0) {
+      // 移动框选区域
+      if (_rectStartPoint != null && _currentDragPoint != null) {
+        setState(() {
+          _rectStartPoint = _rectStartPoint! + offset;
+          _currentDragPoint = _currentDragPoint! + offset;
+        });
+        
+        // 重新分析移动后的区域
+        final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+        _analyzeRectRegion(rect);
+      }
+    } else if (regionIndex > 0 && regionIndex <= _smartAnalysisPoints.length) {
+      // 移动智能分析点
+      final pointIndex = regionIndex - 1;
+      setState(() {
+        final point = _smartAnalysisPoints[pointIndex];
+        final newPosition = (point['position'] as Offset) + offset;
+        _smartAnalysisPoints[pointIndex] = {
+          ...point,
+          'position': newPosition,
+        };
+      });
+      
+      // 重新分析移动后的点
+      final newPosition = _smartAnalysisPoints[pointIndex]['position'] as Offset;
+      _analyzeSkinColorAtPoint(newPosition, '智能分析点 ${pointIndex + 1}');
+    } else if (regionIndex >= 100) {
+      // 移动手动点击结果
+      final resultIndex = regionIndex - 100;
+      if (resultIndex < _analysisResults.length) {
+        final oldResult = _analysisResults[resultIndex];
+        final newPosition = oldResult.position + offset;
+        
+        // 重新分析移动后的位置
+        _analyzeSkinColorAtPoint(newPosition, oldResult.id);
+      }
+    }
   }
 
   /// 检测点击位置是否在拖拽控制点上
@@ -2356,6 +2838,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                 GestureDetector(
                   key: _imageKey,
                   onTapDown: _onImageTap,
+                  onPanStart: _onPanStart,
                   onPanUpdate: _onPanUpdate,
                   onPanEnd: _onPanEnd,
                   child: FadeTransition(
@@ -2398,6 +2881,15 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                                   smartAnalysisPoints: _smartAnalysisPoints,
                                   isShowingScanAnimation: _isShowingScanAnimation,
                                   selectedColorPointIndex: _selectedColorPointIndex,
+                                  showFaceContours: _showFaceContours,
+                                  faceContourPaths: _faceContourPaths,
+                                  faceContourAnimation: _faceContourAnimation,
+                                  landmarkAnimation: _landmarkAnimation,
+                                  isDrawingContours: _isDrawingContours,
+                                  // 长按拖拽相关参数
+                                  isDraggingRegion: _isDraggingRegion,
+                                  draggingRegionIndex: _draggingRegionIndex,
+                                  dragOffset: _dragOffset,
                                 ),
                               );
                             },
@@ -2657,6 +3149,18 @@ class AnalysisPainter extends CustomPainter {
   final List<Map<String, dynamic>> smartAnalysisPoints;
   final bool isShowingScanAnimation;
   final int? selectedColorPointIndex;
+  
+  // 人脸轮廓相关
+  final bool showFaceContours;
+  final List<Map<String, dynamic>> faceContourPaths;
+  final Animation<double>? faceContourAnimation;
+  final Animation<double>? landmarkAnimation;
+  final bool isDrawingContours;
+  
+  // 长按拖拽相关
+  final bool isDraggingRegion;
+  final int? draggingRegionIndex;
+  final Offset? dragOffset;
 
   AnalysisPainter({
     required this.detectedFaces,
@@ -2677,6 +3181,15 @@ class AnalysisPainter extends CustomPainter {
     this.smartAnalysisPoints = const [],
     this.isShowingScanAnimation = false,
     this.selectedColorPointIndex,
+    this.showFaceContours = false,
+    this.faceContourPaths = const [],
+    this.faceContourAnimation,
+    this.landmarkAnimation,
+    this.isDrawingContours = false,
+    // 长按拖拽相关参数
+    this.isDraggingRegion = false,
+    this.draggingRegionIndex,
+    this.dragOffset,
   });
 
   @override
@@ -2686,8 +3199,13 @@ class AnalysisPainter extends CustomPainter {
     final scaleX = size.width / imageSize!.width;
     final scaleY = size.height / imageSize!.height;
 
-    // 绘制人脸框
-    if (analysisMode == AnalysisMode.faceDetection && detectedFaces.isNotEmpty) {
+    // 绘制人脸轮廓和关键点
+    if (analysisMode == AnalysisMode.faceDetection && showFaceContours && faceContourPaths.isNotEmpty) {
+      _drawFaceContours(canvas, size, scaleX, scaleY);
+    }
+    
+    // 绘制传统人脸框（作为备选）
+    if (analysisMode == AnalysisMode.faceDetection && detectedFaces.isNotEmpty && !showFaceContours) {
       final facePaint = Paint()
         ..color = MorandiTheme.warmTone
         ..style = PaintingStyle.stroke
@@ -2820,15 +3338,30 @@ class AnalysisPainter extends CustomPainter {
     
     // 绘制已完成的矩形选择区域（带拖拽控制点）
     if (!isSelectingRect && rectStartPoint != null && currentDragPoint != null) {
-      final completedRect = Rect.fromPoints(rectStartPoint!, currentDragPoint!);
+      var startPoint = rectStartPoint!;
+      var dragPoint = currentDragPoint!;
+      
+      // 应用拖拽偏移
+      if (isDraggingRegion && draggingRegionIndex == 0 && dragOffset != null) {
+        startPoint = startPoint + dragOffset!;
+        dragPoint = dragPoint + dragOffset!;
+      }
+      
+      final completedRect = Rect.fromPoints(startPoint, dragPoint);
+      
+      // 拖拽状态下的特殊视觉效果
+      final isDragging = isDraggingRegion && draggingRegionIndex == 0;
+      final strokeColor = isDragging ? Colors.cyanAccent : MorandiTheme.warmTone;
+      final fillOpacity = isDragging ? 0.2 : 0.12;
+      final strokeWidth = isDragging ? 3.0 : 2.0;
       
       final completedRectPaint = Paint()
-        ..color = MorandiTheme.warmTone
+        ..color = strokeColor
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0;
+        ..strokeWidth = strokeWidth;
 
       final completedFillPaint = Paint()
-        ..color = MorandiTheme.warmTone.withOpacity(0.12)
+        ..color = strokeColor.withOpacity(fillOpacity)
         ..style = PaintingStyle.fill;
 
       // 绘制阴影
@@ -2849,6 +3382,614 @@ class AnalysisPainter extends CustomPainter {
       // 绘制区域标签
       _drawText(canvas, '已选择区域', completedRect.topCenter + const Offset(0, -20), MorandiTheme.primaryText);
     }
+  }
+
+  /// 绘制人脸轮廓和关键点
+  void _drawFaceContours(Canvas canvas, Size size, double scaleX, double scaleY) {
+    final contourProgress = faceContourAnimation?.value ?? 1.0;
+    final landmarkProgress = landmarkAnimation?.value ?? 1.0;
+    
+    for (final faceData in faceContourPaths) {
+      final contours = faceData['contours'] as List<Map<String, dynamic>>;
+      final landmarks = faceData['landmarks'] as List<Map<String, dynamic>>;
+      
+      // 绘制轮廓线条
+      for (final contour in contours) {
+        final points = contour['points'] as List<Offset>;
+        final color = contour['color'] as Color;
+        final strokeWidth = contour['strokeWidth'] as double;
+        final animationDelay = contour['animationDelay'] as int;
+        
+        // 计算当前轮廓的动画进度
+        final delayProgress = (contourProgress * 2000 - animationDelay) / 500;
+        final currentProgress = (delayProgress).clamp(0.0, 1.0);
+        
+        if (currentProgress > 0 && points.length > 1) {
+          _drawAnimatedContourPath(canvas, points, color, strokeWidth, currentProgress, scaleX, scaleY);
+        }
+      }
+      
+      // 绘制关键点
+      for (final landmark in landmarks) {
+        final position = landmark['position'] as Math.Point<int>;
+        final color = landmark['color'] as Color;
+        final pointSize = landmark['size'] as double;
+        final animationDelay = landmark['animationDelay'] as int;
+        
+        // 计算关键点的动画进度
+        final delayProgress = (landmarkProgress * 800 - (animationDelay - 1200)) / 200;
+        final currentProgress = (delayProgress).clamp(0.0, 1.0);
+        
+        if (currentProgress > 0) {
+          _drawAnimatedLandmark(canvas, position, color, pointSize, currentProgress, scaleX, scaleY);
+        }
+      }
+      
+      // 绘制扫描效果
+      if (isDrawingContours) {
+        _drawFaceScanEffect(canvas, faceData['boundingBox'] as Rect, scaleX, scaleY);
+      }
+    }
+  }
+  
+  /// 绘制电影级AI轮廓路径
+  void _drawAnimatedContourPath(Canvas canvas, List<Offset> points, Color color, 
+      double strokeWidth, double progress, double scaleX, double scaleY) {
+    if (points.length < 2) return;
+    
+    final path = Path();
+    final totalPoints = points.length;
+    final visiblePoints = (totalPoints * progress).round();
+    
+    if (visiblePoints > 0) {
+      // 构建路径
+      final firstPoint = Offset(points[0].dx * scaleX, points[0].dy * scaleY);
+      path.moveTo(firstPoint.dx, firstPoint.dy);
+      
+      for (int i = 1; i < visiblePoints && i < points.length; i++) {
+        final point = Offset(points[i].dx * scaleX, points[i].dy * scaleY);
+        path.lineTo(point.dx, point.dy);
+      }
+      
+      // 添加部分线段动画
+      if (visiblePoints < totalPoints && visiblePoints > 0) {
+        final lastCompleteIndex = visiblePoints - 1;
+        final nextIndex = visiblePoints;
+        if (nextIndex < points.length) {
+          final lastPoint = Offset(points[lastCompleteIndex].dx * scaleX, 
+                                 points[lastCompleteIndex].dy * scaleY);
+          final nextPoint = Offset(points[nextIndex].dx * scaleX, 
+                                 points[nextIndex].dy * scaleY);
+          
+          final segmentProgress = (totalPoints * progress) - visiblePoints + 1;
+          final partialPoint = Offset(
+            lastPoint.dx + (nextPoint.dx - lastPoint.dx) * segmentProgress,
+            lastPoint.dy + (nextPoint.dy - lastPoint.dy) * segmentProgress,
+          );
+          path.lineTo(partialPoint.dx, partialPoint.dy);
+        }
+      }
+      
+      // 多层发光效果 - 外层大光晕
+      final outerGlowPaint = Paint()
+        ..color = color.withOpacity(0.1)
+        ..strokeWidth = strokeWidth * 8
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+      canvas.drawPath(path, outerGlowPaint);
+      
+      // 中层光晕
+      final midGlowPaint = Paint()
+        ..color = color.withOpacity(0.3)
+        ..strokeWidth = strokeWidth * 4
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+      canvas.drawPath(path, midGlowPaint);
+      
+      // 内层强光
+      final innerGlowPaint = Paint()
+        ..color = color.withOpacity(0.6)
+        ..strokeWidth = strokeWidth * 2
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+      canvas.drawPath(path, innerGlowPaint);
+      
+      // 主线条 - 渐变效果
+      final mainPaint = Paint()
+        ..shader = LinearGradient(
+          colors: [
+            color.withOpacity(0.8),
+            Colors.white.withOpacity(0.9),
+            color.withOpacity(0.8),
+          ],
+          stops: const [0.0, 0.5, 1.0],
+        ).createShader(path.getBounds())
+        ..strokeWidth = strokeWidth
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      canvas.drawPath(path, mainPaint);
+      
+      // 动态扫描线效果
+      if (progress < 1.0) {
+        _drawScanningEffect(canvas, path, color, progress);
+      }
+      
+      // 绘制节点光点
+      _drawPathNodes(canvas, points, color, progress, scaleX, scaleY, visiblePoints);
+    }
+  }
+  
+  /// 绘制扫描线效果
+  void _drawScanningEffect(Canvas canvas, Path path, Color color, double progress) {
+    final pathMetrics = path.computeMetrics();
+    for (final metric in pathMetrics) {
+      final scanPosition = metric.length * progress;
+      final tangent = metric.getTangentForOffset(scanPosition);
+      if (tangent != null) {
+        final scanPoint = tangent.position;
+        
+        // 扫描光点
+        final scanPaint = Paint()
+          ..color = Colors.white
+          ..style = PaintingStyle.fill
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+        canvas.drawCircle(scanPoint, 4, scanPaint);
+        
+        // 扫描尾迹
+        final trailPaint = Paint()
+          ..shader = RadialGradient(
+            colors: [
+              Colors.white.withOpacity(0.8),
+              color.withOpacity(0.4),
+              Colors.transparent,
+            ],
+            stops: const [0.0, 0.3, 1.0],
+          ).createShader(Rect.fromCircle(center: scanPoint, radius: 15))
+          ..style = PaintingStyle.fill;
+        canvas.drawCircle(scanPoint, 15, trailPaint);
+      }
+    }
+  }
+  
+  /// 绘制路径节点
+  void _drawPathNodes(Canvas canvas, List<Offset> points, Color color, 
+      double progress, double scaleX, double scaleY, int visiblePoints) {
+    for (int i = 0; i < visiblePoints && i < points.length; i++) {
+      final point = Offset(points[i].dx * scaleX, points[i].dy * scaleY);
+      final nodeProgress = (i / points.length).clamp(0.0, progress);
+      
+      if (nodeProgress > 0) {
+        // 节点外圈
+        final nodePaint = Paint()
+          ..color = color.withOpacity(0.3 * nodeProgress)
+          ..style = PaintingStyle.fill
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+        canvas.drawCircle(point, 3 * nodeProgress, nodePaint);
+        
+        // 节点核心
+        final corePaint = Paint()
+          ..color = Colors.white.withOpacity(0.9 * nodeProgress)
+          ..style = PaintingStyle.fill;
+        canvas.drawCircle(point, 1.5 * nodeProgress, corePaint);
+      }
+    }
+  }
+  
+  /// 绘制电影级AI关键点
+  void _drawAnimatedLandmark(Canvas canvas, Math.Point<int> position, Color color, 
+      double size, double progress, double scaleX, double scaleY) {
+    final center = Offset(position.x.toDouble() * scaleX, position.y.toDouble() * scaleY);
+    final animatedSize = size * progress;
+    final time = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    
+    // 多层光晕效果
+    // 外层脉冲光晕
+    final pulseRadius = animatedSize * (3 + Math.sin(time * 3) * 0.5);
+    final pulsePaint = Paint()
+      ..color = color.withOpacity(0.1 * progress * (0.5 + Math.sin(time * 3) * 0.3))
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
+    canvas.drawCircle(center, pulseRadius, pulsePaint);
+    
+    // 中层稳定光晕
+    final midGlowPaint = Paint()
+      ..color = color.withOpacity(0.3 * progress)
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+    canvas.drawCircle(center, animatedSize * 2.5, midGlowPaint);
+    
+    // 内层强光
+    final innerGlowPaint = Paint()
+      ..color = color.withOpacity(0.6 * progress)
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+    canvas.drawCircle(center, animatedSize * 1.5, innerGlowPaint);
+    
+    // 主圆环 - 渐变效果
+    final ringPaint = Paint()
+      ..shader = RadialGradient(
+        colors: [
+          Colors.transparent,
+          color.withOpacity(0.8 * progress),
+          Colors.white.withOpacity(0.9 * progress),
+          color.withOpacity(0.8 * progress),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.3, 0.5, 0.7, 1.0],
+      ).createShader(Rect.fromCircle(center: center, radius: animatedSize))
+      ..style = PaintingStyle.fill;
+    canvas.drawCircle(center, animatedSize, ringPaint);
+    
+    // 核心亮点
+    final corePaint = Paint()
+      ..color = Colors.white.withOpacity(0.95 * progress)
+      ..style = PaintingStyle.fill;
+    canvas.drawCircle(center, animatedSize * 0.3, corePaint);
+    
+    // 旋转光束效果
+    _drawRotatingBeams(canvas, center, animatedSize, color, progress, time);
+    
+    // 数据流效果
+    _drawDataStream(canvas, center, animatedSize, color, progress, time);
+  }
+  
+  /// 绘制旋转光束效果
+  void _drawRotatingBeams(Canvas canvas, Offset center, double size, Color color, double progress, double time) {
+    final beamCount = 4;
+    final beamLength = size * 2;
+    
+    for (int i = 0; i < beamCount; i++) {
+      final angle = (time * 2 + i * Math.pi / 2) % (Math.pi * 2);
+      final startRadius = size * 0.8;
+      final endRadius = startRadius + beamLength;
+      
+      final startX = center.dx + Math.cos(angle) * startRadius;
+      final startY = center.dy + Math.sin(angle) * startRadius;
+      final endX = center.dx + Math.cos(angle) * endRadius;
+      final endY = center.dy + Math.sin(angle) * endRadius;
+      
+      final beamPaint = Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+          colors: [
+            color.withOpacity(0.8 * progress),
+            Colors.white.withOpacity(0.6 * progress),
+            Colors.transparent,
+          ],
+          stops: const [0.0, 0.3, 1.0],
+        ).createShader(Rect.fromPoints(Offset(startX, startY), Offset(endX, endY)))
+        ..strokeWidth = 2
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+      
+      canvas.drawLine(Offset(startX, startY), Offset(endX, endY), beamPaint);
+    }
+  }
+  
+  /// 绘制数据流效果
+  void _drawDataStream(Canvas canvas, Offset center, double size, Color color, double progress, double time) {
+    final particleCount = 8;
+    final radius = size * 1.5;
+    
+    for (int i = 0; i < particleCount; i++) {
+      final angle = (time * 1.5 + i * Math.pi * 2 / particleCount) % (Math.pi * 2);
+      final particleRadius = radius + Math.sin(time * 3 + i) * 10;
+      
+      final x = center.dx + Math.cos(angle) * particleRadius;
+      final y = center.dy + Math.sin(angle) * particleRadius;
+      
+      final particleSize = 2 + Math.sin(time * 4 + i) * 1;
+      
+      final particlePaint = Paint()
+        ..color = color.withOpacity(0.7 * progress * (0.5 + Math.sin(time * 2 + i) * 0.5))
+        ..style = PaintingStyle.fill
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1);
+      
+      canvas.drawCircle(Offset(x, y), particleSize, particlePaint);
+      
+      // 连接线
+      if (i > 0) {
+        final prevAngle = (time * 1.5 + (i-1) * Math.pi * 2 / particleCount) % (Math.pi * 2);
+        final prevRadius = radius + Math.sin(time * 3 + (i-1)) * 10;
+        final prevX = center.dx + Math.cos(prevAngle) * prevRadius;
+        final prevY = center.dy + Math.sin(prevAngle) * prevRadius;
+        
+        final linePaint = Paint()
+          ..color = color.withOpacity(0.3 * progress)
+          ..strokeWidth = 1
+          ..style = PaintingStyle.stroke;
+        
+        canvas.drawLine(Offset(prevX, prevY), Offset(x, y), linePaint);
+      }
+    }
+  }
+  
+  /// 绘制电影级AI人脸扫描效果
+  void _drawFaceScanEffect(Canvas canvas, Rect boundingBox, double scaleX, double scaleY) {
+    final scaledRect = Rect.fromLTRB(
+      boundingBox.left * scaleX,
+      boundingBox.top * scaleY,
+      boundingBox.right * scaleX,
+      boundingBox.bottom * scaleY,
+    );
+    
+    final time = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    
+    // 主扫描框 - 多层发光
+    _drawGlowingRect(canvas, scaledRect, Colors.cyanAccent, time);
+    
+    // 动态四角标记
+    _drawCornerMarkers(canvas, scaledRect, time);
+    
+    // 扫描线动画
+    _drawScanLines(canvas, scaledRect, time);
+    
+    // 数据网格
+    _drawDataGrid(canvas, scaledRect, time);
+    
+    // 边缘粒子效果
+    _drawEdgeParticles(canvas, scaledRect, time);
+    
+    // HUD信息显示
+    _drawHUDInfo(canvas, scaledRect, time);
+  }
+  
+  /// 绘制发光矩形框
+  void _drawGlowingRect(Canvas canvas, Rect rect, Color color, double time) {
+    // 外层大光晕
+    final outerGlowPaint = Paint()
+      ..color = color.withOpacity(0.1)
+      ..strokeWidth = 8
+      ..style = PaintingStyle.stroke
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+    canvas.drawRect(rect, outerGlowPaint);
+    
+    // 中层光晕
+    final midGlowPaint = Paint()
+      ..color = color.withOpacity(0.3)
+      ..strokeWidth = 4
+      ..style = PaintingStyle.stroke
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+    canvas.drawRect(rect, midGlowPaint);
+    
+    // 主框线 - 脉冲效果
+    final pulseOpacity = 0.6 + Math.sin(time * 4) * 0.3;
+    final mainPaint = Paint()
+      ..color = color.withOpacity(pulseOpacity)
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    canvas.drawRect(rect, mainPaint);
+  }
+  
+  /// 绘制动态四角标记
+  void _drawCornerMarkers(Canvas canvas, Rect rect, double time) {
+    final cornerLength = 25.0 + Math.sin(time * 3) * 5;
+    final cornerPaint = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..strokeWidth = 3
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1);
+    
+    // 左上角
+    canvas.drawLine(
+      Offset(rect.left - 5, rect.top),
+      Offset(rect.left + cornerLength, rect.top),
+      cornerPaint,
+    );
+    canvas.drawLine(
+      Offset(rect.left, rect.top - 5),
+      Offset(rect.left, rect.top + cornerLength),
+      cornerPaint,
+    );
+    
+    // 右上角
+    canvas.drawLine(
+      Offset(rect.right + 5, rect.top),
+      Offset(rect.right - cornerLength, rect.top),
+      cornerPaint,
+    );
+    canvas.drawLine(
+      Offset(rect.right, rect.top - 5),
+      Offset(rect.right, rect.top + cornerLength),
+      cornerPaint,
+    );
+    
+    // 左下角
+    canvas.drawLine(
+      Offset(rect.left - 5, rect.bottom),
+      Offset(rect.left + cornerLength, rect.bottom),
+      cornerPaint,
+    );
+    canvas.drawLine(
+      Offset(rect.left, rect.bottom + 5),
+      Offset(rect.left, rect.bottom - cornerLength),
+      cornerPaint,
+    );
+    
+    // 右下角
+    canvas.drawLine(
+      Offset(rect.right + 5, rect.bottom),
+      Offset(rect.right - cornerLength, rect.bottom),
+      cornerPaint,
+    );
+    canvas.drawLine(
+      Offset(rect.right, rect.bottom + 5),
+      Offset(rect.right, rect.bottom - cornerLength),
+      cornerPaint,
+    );
+  }
+  
+  /// 绘制扫描线动画
+  void _drawScanLines(Canvas canvas, Rect rect, double time) {
+    final scanY = rect.top + (rect.height * ((time * 0.5) % 1.0));
+    
+    // 主扫描线
+    final scanPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: [
+          Colors.transparent,
+          Colors.cyanAccent.withOpacity(0.8),
+          Colors.white.withOpacity(0.9),
+          Colors.cyanAccent.withOpacity(0.8),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.2, 0.5, 0.8, 1.0],
+      ).createShader(Rect.fromLTWH(rect.left, scanY - 2, rect.width, 4))
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    
+    canvas.drawLine(
+      Offset(rect.left, scanY),
+      Offset(rect.right, scanY),
+      scanPaint,
+    );
+    
+    // 扫描线光晕
+    final glowPaint = Paint()
+      ..color = Colors.cyanAccent.withOpacity(0.3)
+      ..strokeWidth = 8
+      ..style = PaintingStyle.stroke
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+    
+    canvas.drawLine(
+      Offset(rect.left, scanY),
+      Offset(rect.right, scanY),
+      glowPaint,
+    );
+  }
+  
+  /// 绘制数据网格
+  void _drawDataGrid(Canvas canvas, Rect rect, double time) {
+    final gridPaint = Paint()
+      ..color = Colors.cyanAccent.withOpacity(0.2)
+      ..strokeWidth = 0.5
+      ..style = PaintingStyle.stroke;
+    
+    final gridSpacing = 20.0;
+    
+    // 垂直网格线
+    for (double x = rect.left; x <= rect.right; x += gridSpacing) {
+      final opacity = 0.1 + Math.sin(time * 2 + x * 0.1) * 0.1;
+      gridPaint.color = Colors.cyanAccent.withOpacity(opacity);
+      canvas.drawLine(
+        Offset(x, rect.top),
+        Offset(x, rect.bottom),
+        gridPaint,
+      );
+    }
+    
+    // 水平网格线
+    for (double y = rect.top; y <= rect.bottom; y += gridSpacing) {
+      final opacity = 0.1 + Math.sin(time * 2 + y * 0.1) * 0.1;
+      gridPaint.color = Colors.cyanAccent.withOpacity(opacity);
+      canvas.drawLine(
+        Offset(rect.left, y),
+        Offset(rect.right, y),
+        gridPaint,
+      );
+    }
+  }
+  
+  /// 绘制边缘粒子效果
+  void _drawEdgeParticles(Canvas canvas, Rect rect, double time) {
+    final particleCount = 12;
+    final perimeter = 2 * (rect.width + rect.height);
+    
+    for (int i = 0; i < particleCount; i++) {
+      final progress = ((time * 0.3 + i / particleCount) % 1.0);
+      final distance = progress * perimeter;
+      
+      Offset position;
+      if (distance < rect.width) {
+        // 顶边
+        position = Offset(rect.left + distance, rect.top);
+      } else if (distance < rect.width + rect.height) {
+        // 右边
+        position = Offset(rect.right, rect.top + (distance - rect.width));
+      } else if (distance < 2 * rect.width + rect.height) {
+        // 底边
+        position = Offset(rect.right - (distance - rect.width - rect.height), rect.bottom);
+      } else {
+        // 左边
+        position = Offset(rect.left, rect.bottom - (distance - 2 * rect.width - rect.height));
+      }
+      
+      final particlePaint = Paint()
+        ..color = Colors.white.withOpacity(0.8)
+        ..style = PaintingStyle.fill
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+      
+      canvas.drawCircle(position, 2, particlePaint);
+      
+      // 粒子尾迹
+      final trailPaint = Paint()
+        ..color = Colors.cyanAccent.withOpacity(0.4)
+        ..style = PaintingStyle.fill
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+      
+      canvas.drawCircle(position, 4, trailPaint);
+    }
+  }
+  
+  /// 绘制HUD信息
+  void _drawHUDInfo(Canvas canvas, Rect rect, double time) {
+    // 状态指示器
+    final statusPaint = Paint()
+      ..color = Colors.greenAccent.withOpacity(0.8 + Math.sin(time * 6) * 0.2)
+      ..style = PaintingStyle.fill;
+    
+    canvas.drawCircle(
+      Offset(rect.right - 15, rect.top - 15),
+      3,
+      statusPaint,
+    );
+    
+    // 进度条
+    final progressWidth = 60.0;
+    final progressHeight = 4.0;
+    final progressRect = Rect.fromLTWH(
+      rect.left,
+      rect.bottom + 10,
+      progressWidth,
+      progressHeight,
+    );
+    
+    // 进度条背景
+    final bgPaint = Paint()
+      ..color = Colors.grey.withOpacity(0.3)
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(progressRect, bgPaint);
+    
+    // 进度条填充
+    final progress = (time * 0.5) % 1.0;
+    final fillRect = Rect.fromLTWH(
+      progressRect.left,
+      progressRect.top,
+      progressRect.width * progress,
+      progressRect.height,
+    );
+    
+    final fillPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.cyanAccent,
+          Colors.white,
+          Colors.cyanAccent,
+        ],
+      ).createShader(fillRect)
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(fillRect, fillPaint);
   }
 
   /// 绘制拖拽控制点
@@ -3075,25 +4216,37 @@ class AnalysisPainter extends CustomPainter {
     
     for (int i = 0; i < smartAnalysisPoints.length; i++) {
       final point = smartAnalysisPoints[i];
-      final position = point['position'] as Offset;
+      var position = point['position'] as Offset;
       final color = point['color'] as Color;
       final result = point['result'] as SkinColorResult;
       final isSkinTone = point['isSkinTone'] as bool;
+      
+      // 应用拖拽偏移
+      final regionIndex = i + 1; // 智能分析点索引从1开始
+      if (isDraggingRegion && draggingRegionIndex == regionIndex && dragOffset != null) {
+        position = position + dragOffset!;
+      }
       
       // 延迟动画，让指示点依次出现
       final delayedAnimation = ((animationValue - (i * 0.1)).clamp(0.0, 1.0) / 0.9).clamp(0.0, 1.0);
       
       if (delayedAnimation > 0) {
+        // 拖拽状态下的特殊效果
+        final isDragging = isDraggingRegion && draggingRegionIndex == regionIndex;
+        final dragScale = isDragging ? 1.3 : 1.0;
+        final dragOpacity = isDragging ? 1.0 : delayedAnimation;
+        
         // 指示点大小
-        final pointRadius = 12.0 * delayedAnimation;
-        final ringRadius = 20.0 * delayedAnimation;
+        final pointRadius = 12.0 * delayedAnimation * dragScale;
+        final ringRadius = 20.0 * delayedAnimation * dragScale;
         
         // 绘制外圈（呼吸效果）
         final breathingScale = 1.0 + 0.2 * Math.sin(DateTime.now().millisecondsSinceEpoch / 500.0);
+        final ringColor = isDragging ? Colors.cyanAccent : (isSkinTone ? MorandiTheme.warmTone : MorandiTheme.coolTone);
         final outerRingPaint = Paint()
-          ..color = (isSkinTone ? MorandiTheme.warmTone : MorandiTheme.coolTone).withOpacity(0.3 * delayedAnimation)
+          ..color = ringColor.withOpacity(0.3 * dragOpacity)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.0;
+          ..strokeWidth = isDragging ? 3.0 : 2.0;
         
         canvas.drawCircle(position, ringRadius * breathingScale, outerRingPaint);
         

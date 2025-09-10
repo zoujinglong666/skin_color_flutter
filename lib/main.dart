@@ -503,6 +503,9 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   int? _draggingRegionIndex; // 正在拖拽的区域索引
   Timer? _longPressTimer;
   
+  // 动画列表相关
+  final GlobalKey<AnimatedListState> _listKey = GlobalKey<AnimatedListState>();
+  
   // 动画控制器
   late AnimationController _fadeController;
   late AnimationController _scaleController;
@@ -1128,8 +1131,10 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
               
               if (mounted) {
                 setState(() {
-                  _analysisResults.add(result);
+                  _analysisResults.insert(0, result);
                 });
+                // 触发 AnimatedList 插入动画
+                _listKey.currentState?.insertItem(0);
               }
             }
           }
@@ -1744,9 +1749,9 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     final regionIndex = _getRegionIndexAtPosition(localPosition);
     
     if (regionIndex != null) {
-      // 启动长按定时器
+      // 立即启动长按检测
       _longPressTimer?.cancel();
-      _longPressTimer = Timer(const Duration(milliseconds: 300), () {
+      _longPressTimer = Timer(const Duration(milliseconds: 200), () {
         if (mounted) {
           HapticFeedback.heavyImpact();
           setState(() {
@@ -1755,10 +1760,47 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             _longPressStartPoint = localPosition;
             _draggingRegionIndex = regionIndex;
             _dragOffset = Offset.zero;
+            
+            // 重要：取消其他可能的手势状态
+            _isSelectingRect = false;
+            _isDraggingHandle = false;
           });
           _handleAnimationController.forward();
         }
       });
+    } else if (_analysisMode == AnalysisMode.manualRect) {
+      // 检查是否点击了现有矩形的拖拽控制点
+      if (_rectStartPoint != null && _currentDragPoint != null && !_isSelectingRect) {
+        final existingRect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+        final handleIndex = _getHandleIndex(localPosition, existingRect);
+        
+        if (handleIndex != null) {
+          HapticFeedback.mediumImpact(); // 控制点触觉反馈
+          _handleAnimationController.forward();
+          setState(() {
+            _isDraggingHandle = true;
+            _draggingHandleIndex = handleIndex;
+            
+            // 取消长按定时器
+            _longPressTimer?.cancel();
+          });
+          return;
+        }
+      }
+      
+      // 开始新的框选（如果不是在拖拽控制点）
+      if (!_isDraggingHandle) {
+        setState(() {
+          _rectStartPoint = localPosition;
+          _currentDragPoint = localPosition;
+          _isSelectingRect = true;
+          
+          // 取消长按定时器
+          _longPressTimer?.cancel();
+        });
+        HapticFeedback.selectionClick(); // 开始选择的触觉反馈
+        _rectAnimationController.forward();
+      }
     }
   }
 
@@ -1771,11 +1813,17 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
     final localPosition = renderBox.globalToLocal(details.globalPosition);
     
-    // 处理长按拖拽
+    // 如果移动距离超过阈值，取消长按定时器（防止意外触发）
+    if (_longPressTimer != null && !_isDraggingRegion) {
+      final moveDistance = (localPosition - (_longPressStartPoint ?? localPosition)).distance;
+      if (moveDistance > 15) {
+        _longPressTimer?.cancel();
+        _longPressTimer = null;
+      }
+    }
+    
+    // 处理长按拖拽（优先级最高）
     if (_isDraggingRegion && _draggingRegionIndex != null && _longPressStartPoint != null) {
-      // 取消长按定时器（如果还在运行）
-      _longPressTimer?.cancel();
-      
       // 计算拖拽偏移量
       final newOffset = localPosition - _longPressStartPoint!;
       
@@ -1786,7 +1834,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         _dragOffset = clampedOffset;
       });
       
-      // 轻微的触觉反馈
+      // 轻微的触觉反馈（每10像素一次）
       if ((newOffset - (_dragOffset ?? Offset.zero)).distance > 10) {
         HapticFeedback.selectionClick();
       }
@@ -1844,6 +1892,31 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
   /// 处理拖拽结束事件
   void _onPanEnd(DragEndDetails details) {
+    // 取消长按定时器（如果还在运行）
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    
+    // 处理长按拖拽结束
+    if (_isDraggingRegion && _draggingRegionIndex != null) {
+      HapticFeedback.mediumImpact(); // 完成拖拽的触觉反馈
+      _handleAnimationController.reverse();
+      
+      // 应用拖拽偏移到区域
+      if (_dragOffset != null && _dragOffset != Offset.zero) {
+        _applyDragOffsetToRegion(_draggingRegionIndex!, _dragOffset!);
+      }
+      
+      setState(() {
+        _isDraggingRegion = false;
+        _isLongPressing = false;
+        _draggingRegionIndex = null;
+        _longPressStartPoint = null;
+        _dragOffset = Offset.zero;
+      });
+      return;
+    }
+    
+    // 处理矩形选择结束
     if (_isSelectingRect && _rectStartPoint != null && _currentDragPoint != null) {
       final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
       
@@ -1868,7 +1941,11 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       setState(() {
         _isSelectingRect = false;
       });
-    } else if (_isDraggingHandle && _rectStartPoint != null && _currentDragPoint != null) {
+      return;
+    }
+    
+    // 处理控制点拖拽结束
+    if (_isDraggingHandle && _rectStartPoint != null && _currentDragPoint != null) {
       // 拖拽控制点结束，重新分析区域
       final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
       
@@ -1884,6 +1961,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         _isDraggingHandle = false;
         _draggingHandleIndex = null;
       });
+      return;
     }
   }
 
@@ -1894,77 +1972,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   }
 
   /// 长按开始事件处理
-  void _onLongPressStart(LongPressStartDetails details) {
-    if (_selectedImage == null) return;
 
-    final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
-    if (renderBox == null) return;
-
-    final localPosition = renderBox.globalToLocal(details.globalPosition);
-    
-    // 检查是否长按在已选择的区域上
-    final regionIndex = _getRegionIndexAtPosition(localPosition);
-    
-    if (regionIndex != null) {
-      HapticFeedback.heavyImpact(); // 长按触觉反馈
-      
-      setState(() {
-        _isLongPressing = true;
-        _isDraggingRegion = true;
-        _longPressStartPoint = localPosition;
-        _draggingRegionIndex = regionIndex;
-        _dragOffset = Offset.zero;
-      });
-      
-      // 播放长按动画效果
-      _handleAnimationController.forward();
-    }
-  }
-
-  /// 长按拖拽移动事件处理
-  void _onLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
-    if (!_isDraggingRegion || _draggingRegionIndex == null || _longPressStartPoint == null) return;
-
-    final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
-    if (renderBox == null) return;
-
-    final localPosition = renderBox.globalToLocal(details.globalPosition);
-    
-    // 计算拖拽偏移量
-    final newOffset = localPosition - _longPressStartPoint!;
-    
-    // 边界检查，确保拖拽后的区域不超出图片范围
-    final clampedOffset = _clampDragOffset(newOffset, _draggingRegionIndex!);
-    
-    setState(() {
-      _dragOffset = clampedOffset;
-    });
-    
-    // 轻微的触觉反馈
-    if ((newOffset - (_dragOffset ?? Offset.zero)).distance > 10) {
-      HapticFeedback.selectionClick();
-    }
-  }
-
-  /// 长按拖拽结束事件处理
-  void _onLongPressEnd(LongPressEndDetails details) {
-    if (!_isDraggingRegion || _draggingRegionIndex == null || _dragOffset == null) return;
-
-    HapticFeedback.mediumImpact(); // 拖拽结束触觉反馈
-    
-    // 应用拖拽偏移到实际的区域位置
-    _applyDragOffsetToRegion(_draggingRegionIndex!, _dragOffset!);
-    
-    setState(() {
-      _isLongPressing = false;
-      _isDraggingRegion = false;
-      _longPressStartPoint = null;
-      _draggingRegionIndex = null;
-      _dragOffset = null;
-    });
-    
-    _handleAnimationController.reverse();
-  }
 
   /// 获取指定位置的区域索引
   int? _getRegionIndexAtPosition(Offset position) {
@@ -2189,8 +2197,10 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
           final result = _analyzeSkinTone(dominantColor, displayPoint, label);
           
           setState(() {
-            _analysisResults.add(result);
+            _analysisResults.insert(0, result);
           });
+          // 触发 AnimatedList 插入动画
+          _listKey.currentState?.insertItem(0);
         }
       }
     } catch (e) {
@@ -2451,9 +2461,41 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
   /// 删除指定分析结果
   void _removeResult(String id) {
+    // 找到要删除的项目索引
+    final index = _analysisResults.indexWhere((result) => result.id == id);
+    if (index == -1) return;
+    
+    final removedItem = _analysisResults[index];
+    
+    // 触发 AnimatedList 删除动画
+    _listKey.currentState?.removeItem(
+      index,
+      (context, animation) => _buildAnimatedResultCard(removedItem, index, animation),
+      duration: const Duration(milliseconds: 300),
+    );
+    
+    // 从数据源中移除
     setState(() {
-      _analysisResults.removeWhere((result) => result.id == id);
+      _analysisResults.removeAt(index);
     });
+    
+    // 显示删除反馈和撤销选项
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('已删除颜色 ${removedItem.toString()}'),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
+        action: SnackBarAction(
+          label: '撤销',
+          onPressed: () {
+            setState(() {
+              _analysisResults.insert(index, removedItem);
+            });
+            _listKey.currentState?.insertItem(index);
+          },
+        ),
+      ),
+    );
   }
 
   /// 显示错误对话框
@@ -2983,13 +3025,31 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
   /// 构建结果列表
   Widget _buildResultsList() {
-    return ListView.builder(
+    return AnimatedList(
+      key: _listKey,
       padding: const EdgeInsets.symmetric(horizontal: 16),
-      itemCount: _analysisResults.length,
-      itemBuilder: (context, index) {
+      initialItemCount: _analysisResults.length,
+      itemBuilder: (context, index, animation) {
+        if (index >= _analysisResults.length) return const SizedBox.shrink();
         final result = _analysisResults[index];
-        return _buildResultCard(result, index);
+        return _buildAnimatedResultCard(result, index, animation);
       },
+    );
+  }
+
+  /// 构建动画结果卡片
+  Widget _buildAnimatedResultCard(SkinColorResult result, int index, Animation<double> animation) {
+    return SlideTransition(
+      position: animation.drive(
+        Tween<Offset>(
+          begin: const Offset(1.0, 0.0), // 从右侧滑入
+          end: Offset.zero,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+      ),
+      child: FadeTransition(
+        opacity: animation,
+        child: _buildResultCard(result, index),
+      ),
     );
   }
 

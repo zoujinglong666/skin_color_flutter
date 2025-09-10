@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:math';
+import 'dart:math' as Math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -12,6 +12,7 @@ import 'package:image/image.dart' as img;
 /// 分析模式枚举
 enum AnalysisMode {
   faceDetection, // 人脸检测模式
+  smartAnalysis, // 智能分析模式
   manualPoint,   // 手动点击模式
   manualRect,    // 手动框选模式
 }
@@ -134,10 +135,16 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   Offset? _rectStartPoint;
   Offset? _currentDragPoint;
   bool _isSelectingRect = false;
+  bool _isDraggingHandle = false;
+  int? _draggingHandleIndex; // 0=topLeft, 1=topRight, 2=bottomLeft, 3=bottomRight
+  bool _isHoveringHandle = false;
+  int? _hoveringHandleIndex;
   
   // 动画控制器
   late AnimationController _fadeController;
   late AnimationController _scaleController;
+  late AnimationController _rectAnimationController;
+  late AnimationController _handleAnimationController;
   
   @override
   void initState() {
@@ -150,12 +157,22 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       duration: const Duration(milliseconds: 200),
       vsync: this,
     );
+    _rectAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 150),
+      vsync: this,
+    );
+    _handleAnimationController = AnimationController(
+      duration: const Duration(milliseconds: 100),
+      vsync: this,
+    );
   }
 
   @override
   void dispose() {
     _fadeController.dispose();
     _scaleController.dispose();
+    _rectAnimationController.dispose();
+    _handleAnimationController.dispose();
     super.dispose();
   }
 
@@ -250,6 +267,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       });
       
       if (faces.isNotEmpty && _analysisMode == AnalysisMode.faceDetection) {
+        // 检测到人脸，进行脸颊分析
         final face = faces.first;
         final boundingBox = face.boundingBox;
         
@@ -269,16 +287,594 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
           await _analyzeSkinColorAtPoint(leftCheekDisplay, '左脸颊');
           await _analyzeSkinColorAtPoint(rightCheekDisplay, '右脸颊');
         }
+      } else if (faces.isEmpty) {
+        // 没有检测到人脸，自动切换到智能分析模式
+        setState(() {
+          _analysisMode = AnalysisMode.smartAnalysis;
+        });
+        
+        // 执行智能色调分析
+        await _performSmartAnalysis();
       }
       
       await faceDetector.close();
     } catch (e) {
       print('人脸检测失败: $e');
+      // 检测失败也切换到智能模式
+      setState(() {
+        _analysisMode = AnalysisMode.smartAnalysis;
+      });
+      await _performSmartAnalysis();
     }
 
     setState(() {
       _isAnalyzing = false;
     });
+  }
+
+  /// 智能分析模式 - 分析图片唯一主色 (升级版)
+  Future<void> _performSmartAnalysis() async {
+    if (_selectedImage == null || _imageSize == null) return;
+
+    setState(() {
+      _isAnalyzing = true;
+    });
+
+    try {
+      // 读取图片数据
+      final bytes = await _selectedImage!.readAsBytes();
+      final image = img.decodeImage(bytes);
+      
+      if (image != null) {
+        // 自适应区域采样策略：根据图像特征选择采样区域
+        final allSamples = <Color>[];
+        final regionSamples = <String, List<Color>>{};
+        
+        // 图像分区采样 - 将图像分为9个区域，分别采样
+        final regionWidth = image.width / 3;
+        final regionHeight = image.height / 3;
+        
+        // 降采样以提高性能，但保持足够的采样密度
+        final stepX = Math.max(1, (image.width / 150).round());
+        final stepY = Math.max(1, (image.height / 150).round());
+        
+        // 计算每个区域的颜色样本
+        for (int regionY = 0; regionY < 3; regionY++) {
+          for (int regionX = 0; regionX < 3; regionX++) {
+            final regionKey = '$regionX-$regionY';
+            regionSamples[regionKey] = [];
+            
+            final startX = (regionX * regionWidth).round();
+            final startY = (regionY * regionHeight).round();
+            final endX = ((regionX + 1) * regionWidth).round();
+            final endY = ((regionY + 1) * regionHeight).round();
+            
+            for (int y = startY; y < endY; y += stepY) {
+              for (int x = startX; x < endX; x += stepX) {
+                if (x < image.width && y < image.height) {
+                  final pixel = image.getPixel(x, y);
+                  final color = Color.fromARGB(
+                    255,
+                    pixel.r.toInt(),
+                    pixel.g.toInt(),
+                    pixel.b.toInt(),
+                  );
+                  
+                  // 增强的颜色过滤 - 使用HSV空间进行更精确的过滤
+                  final hsv = HSVColor.fromColor(color);
+                  final brightness = (color.red + color.green + color.blue) / 3;
+                  final saturation = hsv.saturation;
+                  
+                  // 肤色范围过滤 - 基于研究的肤色范围
+                  final isInSkinToneRange = _isLikelySkinTone(color);
+                  
+                  // 过滤条件：亮度适中、饱和度合理、可能是肤色
+                  if (brightness > 50 && brightness < 220 && 
+                      saturation > 0.05 && saturation < 0.85) {
+                    regionSamples[regionKey]!.add(color);
+                    allSamples.add(color);
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        // 分析每个区域的颜色分布
+        final regionAnalysis = <String, Map<String, dynamic>>{};
+        for (final entry in regionSamples.entries) {
+          if (entry.value.isNotEmpty) {
+            final dominantColor = _extractDominantColor(entry.value);
+            final labColor = _rgbToLab(dominantColor.red, dominantColor.green, dominantColor.blue);
+            
+            regionAnalysis[entry.key] = {
+              'color': dominantColor,
+              'count': entry.value.length,
+              'lab': labColor,
+              'isSkinTone': _isLikelySkinTone(dominantColor),
+            };
+          }
+        }
+        
+        // 智能选择最可能的肤色区域
+        Color? selectedColor;
+        String regionDescription = '图片主色调';
+        
+        // 首先尝试找到肤色区域
+        final skinToneRegions = regionAnalysis.entries
+            .where((e) => e.value['isSkinTone'] == true)
+            .toList();
+        
+        if (skinToneRegions.isNotEmpty) {
+          // 按样本数量排序，选择样本最多的肤色区域
+          skinToneRegions.sort((a, b) => 
+              (b.value['count'] as int).compareTo(a.value['count'] as int));
+          selectedColor = skinToneRegions.first.value['color'] as Color;
+          regionDescription = '检测到的肤色';
+        } else if (allSamples.isNotEmpty) {
+          // 如果没有明显的肤色区域，使用全图聚类
+          selectedColor = _extractDominantColor(allSamples);
+        }
+        
+        // 显示分析结果
+        if (selectedColor != null && _displaySize != null) {
+          final centerPoint = Offset(
+            _displaySize!.width / 2,
+            _displaySize!.height / 2,
+          );
+          
+          final result = _analyzeSkinTone(selectedColor, centerPoint, regionDescription);
+          
+          setState(() {
+            _analysisResults.add(result);
+          });
+        }
+      }
+    } catch (e) {
+      print('智能分析失败: $e');
+    }
+
+    setState(() {
+      _isAnalyzing = false;
+    });
+  }
+  
+  /// 判断颜色是否可能是肤色
+  bool _isLikelySkinTone(Color color) {
+    final r = color.red;
+    final g = color.green;
+    final b = color.blue;
+    
+    // 转换为HSV
+    final hsv = HSVColor.fromColor(color);
+    final hue = hsv.hue;
+    final saturation = hsv.saturation;
+    final value = hsv.value;
+    
+    // 肤色的色相通常在[0, 50]或[340, 360]范围内
+    final validHue = (hue >= 0 && hue <= 50) || (hue >= 340 && hue <= 360);
+    
+    // 肤色的饱和度通常不会太高也不会太低
+    final validSaturation = saturation >= 0.1 && saturation <= 0.6;
+    
+    // 肤色的亮度通常不会太暗也不会太亮
+    final validValue = value >= 0.2 && value <= 0.95;
+    
+    // 肤色的RGB通常满足一定的比例关系
+    final validRatio = r > g && g > b && r > 60 && (r - g) > 5;
+    
+    // 综合判断
+    return validHue && validSaturation && validValue && validRatio;
+  }
+
+  /// 计算颜色饱和度
+  double _calculateSaturation(Color color) {
+    final r = color.red / 255.0;
+    final g = color.green / 255.0;
+    final b = color.blue / 255.0;
+    
+    final max = [r, g, b].reduce((a, b) => a > b ? a : b);
+    final min = [r, g, b].reduce((a, b) => a < b ? a : b);
+    
+    if (max == 0) return 0;
+    return (max - min) / max;
+  }
+
+  /// 提取图片的主导色调 - 升级版
+  Color _extractDominantColor(List<Color> samples) {
+    if (samples.isEmpty) return Colors.grey;
+    
+    // 预处理：过滤极端颜色和异常值
+    final filteredSamples = _filterOutlierColors(samples);
+    
+    // 使用改进的K-means++聚类算法，聚类成5个主要颜色以获得更精细的结果
+    final clusters = _performAdvancedKMeans(filteredSamples, 5);
+    
+    // 选择最大的聚类作为主导色
+    clusters.sort((a, b) => b.length.compareTo(a.length));
+    
+    if (clusters.isNotEmpty && clusters.first.isNotEmpty) {
+      // 对最大聚类进行进一步分析，确保颜色代表性
+      final dominantCluster = clusters.first;
+      
+      // 计算聚类中心
+      final clusterCenter = _calculateClusterCenter(dominantCluster);
+      
+      // 计算聚类内颜色的方差，评估聚类质量
+      final variance = _calculateClusterVariance(dominantCluster, clusterCenter);
+      
+      // 如果方差过大，说明聚类不够紧凑，尝试使用中值滤波获得更稳定的结果
+      if (variance > 2000) {
+        return _calculateMedianColor(dominantCluster);
+      }
+      
+      return clusterCenter;
+    }
+    
+    // 如果聚类失败，回退到简单的K-means
+    return _performKMeansClustering(filteredSamples);
+  }
+  
+  /// 过滤异常颜色值
+  List<Color> _filterOutlierColors(List<Color> samples) {
+    if (samples.length < 10) return samples;
+    
+    // 计算亮度和饱和度
+    final brightnessList = samples.map((color) {
+      return (color.red + color.green + color.blue) / 3;
+    }).toList();
+    
+    final saturationList = samples.map(_calculateSaturation).toList();
+    
+    // 计算亮度和饱和度的四分位数
+    brightnessList.sort();
+    saturationList.sort();
+    
+    final q1BrightnessIndex = (brightnessList.length * 0.25).floor();
+    final q3BrightnessIndex = (brightnessList.length * 0.75).floor();
+    final q1Brightness = brightnessList[q1BrightnessIndex];
+    final q3Brightness = brightnessList[q3BrightnessIndex];
+    final iqrBrightness = q3Brightness - q1Brightness;
+    
+    final q1SaturationIndex = (saturationList.length * 0.25).floor();
+    final q3SaturationIndex = (saturationList.length * 0.75).floor();
+    final q1Saturation = saturationList[q1SaturationIndex];
+    final q3Saturation = saturationList[q3SaturationIndex];
+    final iqrSaturation = q3Saturation - q1Saturation;
+    
+    // 定义异常值边界
+    final lowerBrightnessBound = q1Brightness - 1.5 * iqrBrightness;
+    final upperBrightnessBound = q3Brightness + 1.5 * iqrBrightness;
+    final lowerSaturationBound = q1Saturation - 1.5 * iqrSaturation;
+    final upperSaturationBound = q3Saturation + 1.5 * iqrSaturation;
+    
+    // 过滤异常值
+    return samples.where((color) {
+      final brightness = (color.red + color.green + color.blue) / 3;
+      final saturation = _calculateSaturation(color);
+      
+      return brightness >= lowerBrightnessBound && 
+             brightness <= upperBrightnessBound &&
+             saturation >= lowerSaturationBound && 
+             saturation <= upperSaturationBound;
+    }).toList();
+  }
+  
+  /// 计算聚类方差
+  double _calculateClusterVariance(List<Color> cluster, Color center) {
+    if (cluster.isEmpty) return 0;
+    
+    double totalVariance = 0;
+    for (final color in cluster) {
+      final distance = _colorDistance(color, center);
+      totalVariance += distance * distance;
+    }
+    
+    return totalVariance / cluster.length;
+  }
+  
+  /// 计算颜色中值
+  Color _calculateMedianColor(List<Color> colors) {
+    if (colors.isEmpty) return Colors.grey;
+    
+    // 分别排序R、G、B通道
+    final redValues = colors.map((c) => c.red).toList()..sort();
+    final greenValues = colors.map((c) => c.green).toList()..sort();
+    final blueValues = colors.map((c) => c.blue).toList()..sort();
+    
+    // 取中值
+    final medianIndex = colors.length ~/ 2;
+    final medianRed = redValues[medianIndex];
+    final medianGreen = greenValues[medianIndex];
+    final medianBlue = blueValues[medianIndex];
+    
+    return Color.fromARGB(255, medianRed, medianGreen, medianBlue);
+  }
+
+  /// 高级K-means聚类算法 - 升级版
+  List<List<Color>> _performAdvancedKMeans(List<Color> samples, int k) {
+    if (samples.length < k) {
+      return [samples];
+    }
+    
+    // 转换颜色到Lab色彩空间进行聚类，以获得更符合人眼感知的结果
+    final labSamples = <Map<String, dynamic>>[];
+    for (final color in samples) {
+      labSamples.add({
+        'color': color,
+        'lab': _rgbToLab(color.red, color.green, color.blue),
+      });
+    }
+    
+    // 初始化聚类中心
+    final centers = <Map<String, dynamic>>[];
+    final random = Math.Random();
+    
+    // 使用K-means++初始化 - 确保初始中心点分散
+    final firstSample = labSamples[random.nextInt(labSamples.length)];
+    centers.add(firstSample);
+    
+    for (int i = 1; i < k; i++) {
+      final distances = <double>[];
+      double totalDistance = 0;
+      
+      for (final sample in labSamples) {
+        double minDistance = double.infinity;
+        for (final center in centers) {
+          final distance = _labDistance(
+            sample['lab'] as List<double>, 
+            center['lab'] as List<double>
+          );
+          if (distance < minDistance) {
+            minDistance = distance;
+          }
+        }
+        distances.add(minDistance * minDistance);
+        totalDistance += minDistance * minDistance;
+      }
+      
+      // 轮盘赌选择法选择下一个中心点
+      final threshold = random.nextDouble() * totalDistance;
+      double sum = 0;
+      int selectedIndex = labSamples.length - 1; // 默认最后一个
+      
+      for (int j = 0; j < labSamples.length; j++) {
+        sum += distances[j];
+        if (sum >= threshold) {
+          selectedIndex = j;
+          break;
+        }
+      }
+      
+      centers.add(labSamples[selectedIndex]);
+    }
+    
+    // 迭代聚类 - 增加最大迭代次数以提高精度
+    final maxIterations = 15;
+    final convergenceThreshold = 2.0; // Lab空间中的收敛阈值
+    
+    for (int iteration = 0; iteration < maxIterations; iteration++) {
+      final clusters = List.generate(k, (index) => <Map<String, dynamic>>[]);
+      
+      // 分配样本到最近的聚类中心
+      for (final sample in labSamples) {
+        int closestCenter = 0;
+        double minDistance = _labDistance(
+          sample['lab'] as List<double>, 
+          centers[0]['lab'] as List<double>
+        );
+        
+        for (int i = 1; i < centers.length; i++) {
+          final distance = _labDistance(
+            sample['lab'] as List<double>, 
+            centers[i]['lab'] as List<double>
+          );
+          
+          if (distance < minDistance) {
+            minDistance = distance;
+            closestCenter = i;
+          }
+        }
+        
+        clusters[closestCenter].add(sample);
+      }
+      
+      // 更新聚类中心
+      bool changed = false;
+      for (int i = 0; i < k; i++) {
+        if (clusters[i].isNotEmpty) {
+          final newCenter = _calculateLabClusterCenter(clusters[i]);
+          
+          final distance = _labDistance(
+            centers[i]['lab'] as List<double>, 
+            newCenter['lab'] as List<double>
+          );
+          
+          if (distance > convergenceThreshold) {
+            centers[i] = newCenter;
+            changed = true;
+          }
+        }
+      }
+      
+      if (!changed) {
+        // 收敛，返回结果
+        final result = <List<Color>>[];
+        for (final cluster in clusters) {
+          if (cluster.isNotEmpty) {
+            final colorCluster = <Color>[];
+            for (final item in cluster) {
+              colorCluster.add(item['color'] as Color);
+            }
+            result.add(colorCluster);
+          }
+        }
+        return result;
+      }
+    }
+    
+    // 达到最大迭代次数，返回当前结果
+    final finalClusters = List.generate(k, (index) => <Color>[]);
+    
+    for (int i = 0; i < labSamples.length; i++) {
+      final sample = labSamples[i];
+      int closestCenter = 0;
+      double minDistance = _labDistance(
+        sample['lab'] as List<double>, 
+        centers[0]['lab'] as List<double>
+      );
+      
+      for (int j = 1; j < centers.length; j++) {
+        final distance = _labDistance(
+          sample['lab'] as List<double>, 
+          centers[j]['lab'] as List<double>
+        );
+        
+        if (distance < minDistance) {
+          minDistance = distance;
+          closestCenter = j;
+        }
+      }
+      
+      finalClusters[closestCenter].add(sample['color'] as Color);
+    }
+    
+    return finalClusters.where((cluster) => cluster.isNotEmpty).toList();
+  }
+  
+  /// 计算Lab色彩空间中的聚类中心
+  Map<String, dynamic> _calculateLabClusterCenter(List<Map<String, dynamic>> cluster) {
+    if (cluster.isEmpty) {
+      return {
+        'color': Colors.grey,
+        'lab': [50.0, 0.0, 0.0],
+      };
+    }
+    
+    double totalL = 0, totalA = 0, totalB = 0;
+    
+    for (final item in cluster) {
+      final lab = item['lab'] as List<double>;
+      totalL += lab[0];
+      totalA += lab[1];
+      totalB += lab[2];
+    }
+    
+    final avgL = totalL / cluster.length;
+    final avgA = totalA / cluster.length;
+    final avgB = totalB / cluster.length;
+    
+    // 将Lab转回RGB
+    final rgb = _labToRgb(avgL, avgA, avgB);
+    
+    return {
+      'color': Color.fromARGB(255, rgb[0], rgb[1], rgb[2]),
+      'lab': [avgL, avgA, avgB],
+    };
+  }
+  
+  /// Lab色彩空间中的距离计算
+  double _labDistance(List<double> lab1, List<double> lab2) {
+    final dL = lab1[0] - lab2[0];
+    final dA = lab1[1] - lab2[1];
+    final dB = lab1[2] - lab2[2];
+    
+    // 使用CIEDE2000色差公式的简化版本
+    // 给a和b通道更高的权重，因为它们对色调感知更重要
+    return Math.sqrt(dL * dL + 2.5 * dA * dA + 2.5 * dB * dB);
+  }
+  
+  /// Lab转RGB
+  List<int> _labToRgb(double L, double a, double b) {
+    // Lab到XYZ
+    double y = (L + 16) / 116;
+    double x = a / 500 + y;
+    double z = y - b / 200;
+    
+    // 应用反函数
+    x = x > 0.206893 ? x * x * x : (x - 16 / 116) / 7.787;
+    y = y > 0.206893 ? y * y * y : (y - 16 / 116) / 7.787;
+    z = z > 0.206893 ? z * z * z : (z - 16 / 116) / 7.787;
+    
+    // 参考白点D65
+    const xn = 0.95047;
+    const yn = 1.0;
+    const zn = 1.08883;
+    
+    x = x * xn;
+    y = y * yn;
+    z = z * zn;
+    
+    // XYZ到RGB
+    double r = x * 3.2406 + y * -1.5372 + z * -0.4986;
+    double g = x * -0.9689 + y * 1.8758 + z * 0.0415;
+    double b_val = x * 0.0557 + y * -0.2040 + z * 1.0570;
+    
+    // 线性RGB到sRGB
+    r = r > 0.0031308 ? 1.055 * Math.pow(r, 1/2.4) - 0.055 : 12.92 * r;
+    g = g > 0.0031308 ? 1.055 * Math.pow(g, 1/2.4) - 0.055 : 12.92 * g;
+    b_val = b_val > 0.0031308 ? 1.055 * Math.pow(b_val, 1/2.4) - 0.055 : 12.92 * b_val;
+    
+    // 限制在0-255范围内
+    int ri = (r * 255).round().clamp(0, 255);
+    int gi = (g * 255).round().clamp(0, 255);
+    int bi = (b_val * 255).round().clamp(0, 255);
+    
+    return [ri, gi, bi];
+  }
+
+  /// 计算聚类中心颜色
+  Color _calculateClusterCenter(List<Color> cluster) {
+    if (cluster.isEmpty) return Colors.grey;
+    
+    int totalR = 0, totalG = 0, totalB = 0;
+    for (final color in cluster) {
+      totalR += color.red;
+      totalG += color.green;
+      totalB += color.blue;
+    }
+    
+    return Color.fromARGB(
+      255,
+      (totalR / cluster.length).round(),
+      (totalG / cluster.length).round(),
+      (totalB / cluster.length).round(),
+    );
+  }
+
+  /// 计算两个颜色之间的距离
+  double _colorDistance(Color a, Color b) {
+    final dr = a.red - b.red;
+    final dg = a.green - b.green;
+    final db = a.blue - b.blue;
+    return Math.sqrt(dr * dr + dg * dg + db * db);
+  }
+
+  /// 生成智能采样点
+  List<Offset> _generateSmartSamplePoints(int width, int height) {
+    final points = <Offset>[];
+    
+    // 九宫格采样策略
+    final gridX = [0.2, 0.5, 0.8];
+    final gridY = [0.3, 0.5, 0.7];
+    
+    for (final x in gridX) {
+      for (final y in gridY) {
+        points.add(Offset(width * x, height * y));
+      }
+    }
+    
+    // 如果图片较大，添加更多采样点
+    if (width > 800 || height > 800) {
+      points.addAll([
+        Offset(width * 0.15, height * 0.15),
+        Offset(width * 0.85, height * 0.15),
+        Offset(width * 0.15, height * 0.85),
+        Offset(width * 0.85, height * 0.85),
+      ]);
+    }
+    
+    return points;
   }
 
   /// 处理图片点击事件
@@ -296,13 +892,32 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
     if (_analysisMode == AnalysisMode.manualPoint) {
       // 点击模式：分析点击位置
+      HapticFeedback.lightImpact(); // 触觉反馈
       _scaleController.forward().then((_) {
         _scaleController.reverse();
       });
       _analyzeSkinColorAtPoint(localPosition, '自定义区域 ${_analysisResults.length + 1}');
     } else if (_analysisMode == AnalysisMode.manualRect) {
-      // 框选模式：开始框选
-      if (!_isSelectingRect) {
+      // 框选模式：检查是否点击了现有矩形的拖拽控制点
+      if (_rectStartPoint != null && _currentDragPoint != null && !_isSelectingRect) {
+        final existingRect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+        final handleIndex = _getHandleIndex(localPosition, existingRect);
+        
+        if (handleIndex != null) {
+          HapticFeedback.mediumImpact(); // 控制点触觉反馈
+          _handleAnimationController.forward();
+          setState(() {
+            _isDraggingHandle = true;
+            _draggingHandleIndex = handleIndex;
+          });
+          return;
+        }
+      }
+      
+      // 开始新的框选
+      if (!_isSelectingRect && !_isDraggingHandle) {
+        HapticFeedback.selectionClick(); // 开始选择的触觉反馈
+        _rectAnimationController.forward();
         setState(() {
           _rectStartPoint = localPosition;
           _currentDragPoint = localPosition;
@@ -314,16 +929,60 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
 
   /// 处理拖拽更新事件
   void _onPanUpdate(DragUpdateDetails details) {
-    if (_selectedImage == null || !_isSelectingRect) return;
+    if (_selectedImage == null) return;
 
     final RenderBox? renderBox = _imageKey.currentContext?.findRenderObject() as RenderBox?;
     if (renderBox == null) return;
 
     final localPosition = renderBox.globalToLocal(details.globalPosition);
     
-    setState(() {
-      _currentDragPoint = localPosition;
-    });
+    // 边界检查，确保拖拽不超出图片范围
+    final clampedPosition = Offset(
+      localPosition.dx.clamp(0.0, renderBox.size.width),
+      localPosition.dy.clamp(0.0, renderBox.size.height),
+    );
+    
+    if (_isSelectingRect) {
+      // 正在创建新的矩形选择
+      setState(() {
+        _currentDragPoint = clampedPosition;
+      });
+    } else if (_isDraggingHandle && _draggingHandleIndex != null && _rectStartPoint != null && _currentDragPoint != null) {
+      // 正在拖拽现有矩形的控制点
+      setState(() {
+        switch (_draggingHandleIndex!) {
+          case 0: // topLeft
+            _rectStartPoint = clampedPosition;
+            break;
+          case 1: // topRight
+            _rectStartPoint = Offset(_rectStartPoint!.dx, clampedPosition.dy);
+            _currentDragPoint = Offset(clampedPosition.dx, _currentDragPoint!.dy);
+            break;
+          case 2: // bottomLeft
+            _rectStartPoint = Offset(clampedPosition.dx, _rectStartPoint!.dy);
+            _currentDragPoint = Offset(_currentDragPoint!.dx, clampedPosition.dy);
+            break;
+          case 3: // bottomRight
+            _currentDragPoint = clampedPosition;
+            break;
+        }
+      });
+    } else if (!_isSelectingRect && !_isDraggingHandle && _rectStartPoint != null && _currentDragPoint != null) {
+      // 检查是否悬停在控制点上
+      final existingRect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+      final hoveringIndex = _getHandleIndex(clampedPosition, existingRect);
+      
+      if (hoveringIndex != _hoveringHandleIndex) {
+        setState(() {
+          _isHoveringHandle = hoveringIndex != null;
+          _hoveringHandleIndex = hoveringIndex;
+        });
+        
+        if (hoveringIndex != null) {
+          HapticFeedback.selectionClick(); // 悬停反馈
+        }
+      }
+    }
   }
 
   /// 处理拖拽结束事件
@@ -331,13 +990,42 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     if (_isSelectingRect && _rectStartPoint != null && _currentDragPoint != null) {
       final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
       
-      // 分析矩形区域内的肤色
-      _analyzeRectRegion(rect);
+      // 检查矩形是否有效（最小尺寸）
+      if (rect.width.abs() > 10 && rect.height.abs() > 10) {
+        HapticFeedback.mediumImpact(); // 完成选择的触觉反馈
+        
+        // 播放完成动画
+        _rectAnimationController.reverse();
+        
+        // 分析矩形区域内的肤色
+        _analyzeRectRegion(rect);
+      } else {
+        // 矩形太小，取消选择
+        HapticFeedback.lightImpact();
+        setState(() {
+          _rectStartPoint = null;
+          _currentDragPoint = null;
+        });
+      }
       
       setState(() {
         _isSelectingRect = false;
-        _rectStartPoint = null;
-        _currentDragPoint = null;
+      });
+    } else if (_isDraggingHandle && _rectStartPoint != null && _currentDragPoint != null) {
+      // 拖拽控制点结束，重新分析区域
+      final rect = Rect.fromPoints(_rectStartPoint!, _currentDragPoint!);
+      
+      HapticFeedback.mediumImpact(); // 完成拖拽的触觉反馈
+      _handleAnimationController.reverse();
+      
+      // 检查调整后的矩形是否有效
+      if (rect.width.abs() > 10 && rect.height.abs() > 10) {
+        _analyzeRectRegion(rect);
+      }
+      
+      setState(() {
+        _isDraggingHandle = false;
+        _draggingHandleIndex = null;
       });
     }
   }
@@ -346,6 +1034,34 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   Future<void> _analyzeRectRegion(Rect rect) async {
     final center = rect.center;
     await _analyzeSkinColorAtPoint(center, '框选区域 ${_analysisResults.length + 1}');
+  }
+
+  /// 检测点击位置是否在拖拽控制点上
+  int? _getHandleIndex(Offset tapPoint, Rect rect) {
+    const handleRadius = 25.0; // 增大控制点检测半径，提升触摸体验
+    
+    final corners = [
+      rect.topLeft,     // 0
+      rect.topRight,    // 1
+      rect.bottomLeft,  // 2
+      rect.bottomRight, // 3
+    ];
+    
+    // 按距离排序，优先选择最近的控制点
+    final distances = <MapEntry<int, double>>[];
+    for (int i = 0; i < corners.length; i++) {
+      final distance = (tapPoint - corners[i]).distance;
+      if (distance <= handleRadius) {
+        distances.add(MapEntry(i, distance));
+      }
+    }
+    
+    if (distances.isNotEmpty) {
+      distances.sort((a, b) => a.value.compareTo(b.value));
+      return distances.first.key;
+    }
+    
+    return null;
   }
 
   /// 分析指定点的肤色
@@ -442,7 +1158,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     );
   }
 
-  /// 分析肤色色调
+  /// 分析肤色色调 - 升级版算法
   SkinColorResult _analyzeSkinTone(Color color, Offset position, String label) {
     final r = color.red;
     final g = color.green;
@@ -454,35 +1170,92 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     final saturation = hsv.saturation;
     final value = hsv.value;
     
-    // 计算红黄比例
+    // 转换为Lab色彩空间进行更精确的分析
+    final labColor = _rgbToLab(r, g, b);
+    final a = labColor[1]; // a轴: 负值为绿色，正值为红色
+    final b_lab = labColor[2]; // b轴: 负值为蓝色，正值为黄色
+    
+    // 计算色彩特征比例
     final redYellowRatio = r / (g + 1); // 避免除零
     final yellowRatio = (r + g) / (b + 1);
+    final redBlueRatio = r / (b + 1);
     
-    // 肤色分类逻辑
+    // ITA值计算 (Individual Typology Angle) - 肤色分类的专业指标
+    final L = labColor[0];
+    final ITA = (Math.atan((L - 50) / b_lab) * 180 / Math.pi).toDouble();
+    
+    // 肤色分类逻辑 - 升级版
     String toneType;
     String warmCoolType;
     String emoji;
     
-    if (hue >= 15 && hue <= 35 && yellowRatio > 1.8) {
-      // 偏黄调
-      toneType = '偏黄调';
-      warmCoolType = '暖色调';
-      emoji = '☀️';
-    } else if (hue >= 340 || hue <= 15) {
-      // 偏粉调
-      toneType = '偏粉调';
-      warmCoolType = '冷色调';
-      emoji = '❄️';
-    } else if (redYellowRatio > 1.2 && saturation > 0.3) {
-      // 偏红调
-      toneType = '偏红调';
-      warmCoolType = '暖色调';
-      emoji = '🌸';
+    // 基于ITA值的肤色分类
+    if (ITA > 55) {
+      // 非常白皙
+      toneType = '白皙肤色';
+      emoji = '✨';
+      
+      if (a > 8) {
+        warmCoolType = '暖白皙';
+      } else if (a < 0) {
+        warmCoolType = '冷白皙';
+      } else {
+        warmCoolType = '中性白皙';
+      }
+    } else if (ITA > 41) {
+      // 浅色肤色
+      toneType = '浅色肤色';
+      emoji = '🌟';
+      
+      if (a > 10 && b_lab > 15) {
+        warmCoolType = '暖浅色调';
+      } else if (a < 8) {
+        warmCoolType = '冷浅色调';
+      } else {
+        warmCoolType = '中性浅色调';
+      }
+    } else if (ITA > 28) {
+      // 中等肤色
+      toneType = '中等肤色';
+      emoji = '🌼';
+      
+      if (b_lab > 18 && a > 10) {
+        warmCoolType = '暖中性调';
+      } else if (b_lab < 15 || a < 8) {
+        warmCoolType = '冷中性调';
+      } else {
+        warmCoolType = '中性调';
+      }
+    } else if (ITA > 10) {
+      // 小麦色
+      toneType = '小麦肤色';
+      emoji = '🌞';
+      
+      if (b_lab > 20) {
+        warmCoolType = '暖小麦色';
+      } else {
+        warmCoolType = '中性小麦色';
+      }
     } else {
-      // 中性调
-      toneType = '中性调';
-      warmCoolType = '平衡色调';
-      emoji = '🌿';
+      // 深色肤色
+      toneType = '深色肤色';
+      emoji = '🌹';
+      
+      if (b_lab > 15) {
+        warmCoolType = '暖深色调';
+      } else {
+        warmCoolType = '中性深色调';
+      }
+    }
+    
+    // 细化冷暖色调判断 - 基于色相和Lab值的综合分析
+    if (warmCoolType.contains('中性')) {
+      // 进一步细分中性调
+      if ((hue >= 20 && hue <= 40) && yellowRatio > 1.9) {
+        warmCoolType = warmCoolType.replaceAll('中性', '暖');
+      } else if ((hue >= 340 || hue <= 10) && redBlueRatio > 1.5) {
+        warmCoolType = warmCoolType.replaceAll('中性', '冷');
+      }
     }
     
     return SkinColorResult(
@@ -497,6 +1270,44 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
       emoji: emoji,
       createdAt: DateTime.now(),
     );
+  }
+  
+  /// RGB转Lab色彩空间 - 用于更精确的肤色分析
+  List<double> _rgbToLab(int r, int g, int b_value) {
+    // 转换为标准RGB
+    double r_linear = r / 255.0;
+    double g_linear = g / 255.0;
+    double b_linear = b_value / 255.0;
+    
+    // sRGB到线性RGB的转换
+    r_linear = r_linear <= 0.04045 ? r_linear / 12.92 : (Math.pow((r_linear + 0.055) / 1.055, 2.4) as double);
+    g_linear = g_linear <= 0.04045 ? g_linear / 12.92 : (Math.pow((g_linear + 0.055) / 1.055, 2.4) as double);
+    b_linear = b_linear <= 0.04045 ? b_linear / 12.92 : (Math.pow((b_linear + 0.055) / 1.055, 2.4) as double);
+    
+    // 线性RGB到XYZ的转换
+    double x = r_linear * 0.4124 + g_linear * 0.3576 + b_linear * 0.1805;
+    double y = r_linear * 0.2126 + g_linear * 0.7152 + b_linear * 0.0722;
+    double z = r_linear * 0.0193 + g_linear * 0.1192 + b_linear * 0.9505;
+    
+    // XYZ到Lab的转换
+    // 参考白点D65
+    const xn = 0.95047;
+    const yn = 1.0;
+    const zn = 1.08883;
+    
+    x = x / xn;
+    y = y / yn;
+    z = z / zn;
+    
+    x = x > 0.008856 ? (Math.pow(x, 1/3) as double) : (7.787 * x) + (16 / 116);
+    y = y > 0.008856 ? (Math.pow(y, 1/3) as double) : (7.787 * y) + (16 / 116);
+    z = z > 0.008856 ? (Math.pow(z, 1/3) as double) : (7.787 * z) + (16 / 116);
+    
+    final L = (116 * y) - 16;
+    final a = 500 * (x - y);
+    final b_component = 200 * (y - z);
+    
+    return [L, a, b_component];
   }
 
   /// 清除所有分析结果
@@ -614,6 +1425,13 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                         ),
                         Expanded(
                           child: _buildModeButton(
+                            icon: Icons.auto_awesome_rounded,
+                            label: '智能',
+                            mode: AnalysisMode.smartAnalysis,
+                          ),
+                        ),
+                        Expanded(
+                          child: _buildModeButton(
                             icon: Icons.touch_app_rounded,
                             label: '点选',
                             mode: AnalysisMode.manualPoint,
@@ -671,9 +1489,13 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
               _currentDragPoint = null;
             });
             
-            // 如果切换到人脸模式且有图片，重新进行人脸检测
-            if (mode == AnalysisMode.faceDetection && _selectedImage != null) {
-              _performFaceDetection();
+            // 根据模式执行相应的分析
+            if (_selectedImage != null) {
+              if (mode == AnalysisMode.faceDetection) {
+                _performFaceDetection();
+              } else if (mode == AnalysisMode.smartAnalysis) {
+                _performSmartAnalysis();
+              }
             }
           },
           borderRadius: BorderRadius.circular(8),
@@ -809,6 +1631,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   /// 构建功能特色列表
   Widget _buildFeatureList() {
     final features = [
+      {'icon': '🤖', 'text': '智能提取图片主色调'},
       {'icon': '🎯', 'text': '多点取色对比分析'},
       {'icon': '🌈', 'text': '精准色调分类识别'},
       {'icon': '💄', 'text': '专业护肤建议参考'},
@@ -874,16 +1697,27 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
                         ),
                         // Canvas绘制层
                         Positioned.fill(
-                          child: CustomPaint(
-                            painter: AnalysisPainter(
-                              detectedFaces: _detectedFaces,
-                              imageSize: _imageSize,
-                              displaySize: _displaySize,
-                              rectStartPoint: _rectStartPoint,
-                              currentDragPoint: _currentDragPoint,
-                              isSelectingRect: _isSelectingRect,
-                              analysisMode: _analysisMode,
-                            ),
+                          child: AnimatedBuilder(
+                            animation: Listenable.merge([_rectAnimationController, _handleAnimationController]),
+                            builder: (context, child) {
+                              return CustomPaint(
+                                painter: AnalysisPainter(
+                                  detectedFaces: _detectedFaces,
+                                  imageSize: _imageSize,
+                                  displaySize: _displaySize,
+                                  rectStartPoint: _rectStartPoint,
+                                  currentDragPoint: _currentDragPoint,
+                                  isSelectingRect: _isSelectingRect,
+                                  isDraggingHandle: _isDraggingHandle,
+                                  draggingHandleIndex: _draggingHandleIndex,
+                                  isHoveringHandle: _isHoveringHandle,
+                                  hoveringHandleIndex: _hoveringHandleIndex,
+                                  analysisMode: _analysisMode,
+                                  rectAnimation: _rectAnimationController,
+                                  handleAnimation: _handleAnimationController,
+                                ),
+                              );
+                            },
                           ),
                         ),
                       ],
@@ -1128,7 +1962,13 @@ class AnalysisPainter extends CustomPainter {
   final Offset? rectStartPoint;
   final Offset? currentDragPoint;
   final bool isSelectingRect;
+  final bool isDraggingHandle;
+  final int? draggingHandleIndex;
+  final bool isHoveringHandle;
+  final int? hoveringHandleIndex;
   final AnalysisMode analysisMode;
+  final Animation<double>? rectAnimation;
+  final Animation<double>? handleAnimation;
 
   AnalysisPainter({
     required this.detectedFaces,
@@ -1137,7 +1977,13 @@ class AnalysisPainter extends CustomPainter {
     this.rectStartPoint,
     this.currentDragPoint,
     this.isSelectingRect = false,
+    this.isDraggingHandle = false,
+    this.draggingHandleIndex,
+    this.isHoveringHandle = false,
+    this.hoveringHandleIndex,
     required this.analysisMode,
+    this.rectAnimation,
+    this.handleAnimation,
   });
 
   @override
@@ -1218,26 +2064,202 @@ class AnalysisPainter extends CustomPainter {
       }
     }
 
+    // 绘制智能分析模式的扫描效果
+    if (analysisMode == AnalysisMode.smartAnalysis) {
+      final scanPaint = Paint()
+        ..color = MorandiTheme.neutralTone.withOpacity(0.4)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+
+      final scanFillPaint = Paint()
+        ..color = MorandiTheme.neutralTone.withOpacity(0.05)
+        ..style = PaintingStyle.fill;
+
+      // 绘制全图扫描网格
+      final gridSize = 40.0;
+      for (double x = 0; x < size.width; x += gridSize) {
+        for (double y = 0; y < size.height; y += gridSize) {
+          final rect = Rect.fromLTWH(x, y, gridSize, gridSize);
+          canvas.drawRect(rect, scanFillPaint);
+        }
+      }
+      
+      // 绘制边框
+      canvas.drawRect(
+        Rect.fromLTWH(0, 0, size.width, size.height),
+        scanPaint,
+      );
+      
+      // 绘制中心标记
+      final center = Offset(size.width / 2, size.height / 2);
+      canvas.drawCircle(
+        center,
+        20,
+        Paint()..color = MorandiTheme.neutralTone.withOpacity(0.3)..style = PaintingStyle.fill,
+      );
+      canvas.drawCircle(
+        center,
+        20,
+        Paint()..color = MorandiTheme.neutralTone..style = PaintingStyle.stroke..strokeWidth = 2,
+      );
+      
+      // 绘制智能分析标签
+      _drawText(canvas, '智能主色提取', Offset(size.width / 2, 25), MorandiTheme.primaryText);
+    }
+
     // 绘制框选区域
     if (isSelectingRect && rectStartPoint != null && currentDragPoint != null) {
       final rect = Rect.fromPoints(rectStartPoint!, currentDragPoint!);
       
+      // 动画透明度
+      double animationOpacity = 1.0;
+      if (rectAnimation != null) {
+        animationOpacity = 0.3 + 0.7 * rectAnimation!.value;
+      }
+      
       final rectPaint = Paint()
-        ..color = MorandiTheme.accentPink
+        ..color = MorandiTheme.accentPink.withOpacity(animationOpacity)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0;
+        ..strokeWidth = 2.5;
 
       final rectFillPaint = Paint()
-        ..color = MorandiTheme.accentPink.withOpacity(0.2)
+        ..color = MorandiTheme.accentPink.withOpacity(0.15 * animationOpacity)
         ..style = PaintingStyle.fill;
 
+      // 绘制选择区域
       canvas.drawRect(rect, rectFillPaint);
       _drawDashedRect(canvas, rect, rectPaint);
       
-      // 显示尺寸
+      // 只在有效矩形区域时显示尺寸（避免显示0×0）
       final width = rect.width.abs().toInt();
       final height = rect.height.abs().toInt();
-      _drawText(canvas, '${width}×${height}', rect.center, MorandiTheme.primaryText);
+      if (width > 5 && height > 5) {
+        // 添加背景以提高文字可读性
+        final textBg = Paint()
+          ..color = Colors.black.withOpacity(0.6 * animationOpacity)
+          ..style = PaintingStyle.fill;
+        
+        final textRect = Rect.fromCenter(
+          center: rect.center,
+          width: 80,
+          height: 24,
+        );
+        
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(textRect, const Radius.circular(12)),
+          textBg,
+        );
+        
+        _drawText(canvas, '${width}×${height}', rect.center, Colors.white.withOpacity(animationOpacity));
+      }
+      
+      // 绘制角落指示器
+      _drawCornerIndicators(canvas, rect, animationOpacity);
+    }
+    
+    // 绘制已完成的矩形选择区域（带拖拽控制点）
+    if (!isSelectingRect && rectStartPoint != null && currentDragPoint != null) {
+      final completedRect = Rect.fromPoints(rectStartPoint!, currentDragPoint!);
+      
+      final completedRectPaint = Paint()
+        ..color = MorandiTheme.warmTone
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+
+      final completedFillPaint = Paint()
+        ..color = MorandiTheme.warmTone.withOpacity(0.12)
+        ..style = PaintingStyle.fill;
+
+      // 绘制阴影
+      final shadowPaint = Paint()
+        ..color = Colors.black.withOpacity(0.1)
+        ..style = PaintingStyle.fill
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+      
+      canvas.drawRect(completedRect.shift(const Offset(2, 2)), shadowPaint);
+      
+      // 绘制完成的选择区域
+      canvas.drawRect(completedRect, completedFillPaint);
+      canvas.drawRect(completedRect, completedRectPaint);
+      
+      // 绘制拖拽控制点
+      _drawDragHandles(canvas, completedRect);
+      
+      // 绘制区域标签
+      _drawText(canvas, '已选择区域', completedRect.topCenter + const Offset(0, -20), MorandiTheme.primaryText);
+    }
+  }
+
+  /// 绘制拖拽控制点
+  void _drawDragHandles(Canvas canvas, Rect rect) {
+    const baseHandleRadius = 8.0;
+    const hoverHandleRadius = 12.0;
+    const activeHandleRadius = 10.0;
+    
+    // 四个角的控制点
+    final corners = [
+      rect.topLeft,
+      rect.topRight,
+      rect.bottomLeft,
+      rect.bottomRight,
+    ];
+    
+    for (int i = 0; i < corners.length; i++) {
+      final corner = corners[i];
+      
+      // 根据状态确定控制点大小和颜色
+      double handleRadius = baseHandleRadius;
+      Color handleColor = MorandiTheme.warmTone;
+      Color strokeColor = Colors.white;
+      double strokeWidth = 2.0;
+      
+      if (isDraggingHandle && draggingHandleIndex == i) {
+        // 正在拖拽的控制点
+        handleRadius = activeHandleRadius;
+        handleColor = MorandiTheme.accentPink;
+        strokeWidth = 3.0;
+        
+        // 应用动画缩放
+        if (handleAnimation != null) {
+          handleRadius *= (1.0 + handleAnimation!.value * 0.3);
+        }
+      } else if (isHoveringHandle && hoveringHandleIndex == i) {
+        // 悬停状态的控制点
+        handleRadius = hoverHandleRadius;
+        handleColor = MorandiTheme.coolTone;
+        strokeWidth = 2.5;
+      }
+      
+      final handlePaint = Paint()
+        ..color = handleColor
+        ..style = PaintingStyle.fill;
+        
+      final handleStrokePaint = Paint()
+        ..color = strokeColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth;
+      
+      // 绘制阴影
+      final shadowPaint = Paint()
+        ..color = Colors.black.withOpacity(0.2)
+        ..style = PaintingStyle.fill
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+      
+      canvas.drawCircle(corner + const Offset(1, 1), handleRadius, shadowPaint);
+      
+      // 绘制控制点
+      canvas.drawCircle(corner, handleRadius, handlePaint);
+      canvas.drawCircle(corner, handleRadius, handleStrokePaint);
+      
+      // 为活跃的控制点添加脉冲效果
+      if (isDraggingHandle && draggingHandleIndex == i && handleAnimation != null) {
+        final pulsePaint = Paint()
+          ..color = MorandiTheme.accentPink.withOpacity(0.3 * (1.0 - handleAnimation!.value))
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.0;
+        
+        canvas.drawCircle(corner, handleRadius + handleAnimation!.value * 8, pulsePaint);
+      }
     }
   }
 
@@ -1265,6 +2287,52 @@ class AnalysisPainter extends CustomPainter {
       final dashEnd = Offset.lerp(start, end, endRatio)!;
       
       canvas.drawLine(dashStart, dashEnd, paint);
+    }
+  }
+
+  /// 绘制角落指示器
+  void _drawCornerIndicators(Canvas canvas, Rect rect, double opacity) {
+    const indicatorLength = 20.0;
+    const indicatorWidth = 3.0;
+    
+    final indicatorPaint = Paint()
+      ..color = MorandiTheme.accentPink.withOpacity(opacity)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = indicatorWidth
+      ..strokeCap = StrokeCap.round;
+    
+    // 四个角的L形指示器
+    final corners = [
+      rect.topLeft,
+      rect.topRight,
+      rect.bottomLeft,
+      rect.bottomRight,
+    ];
+    
+    final directions = [
+      [const Offset(1, 0), const Offset(0, 1)],   // 右、下
+      [const Offset(-1, 0), const Offset(0, 1)],  // 左、下
+      [const Offset(1, 0), const Offset(0, -1)],  // 右、上
+      [const Offset(-1, 0), const Offset(0, -1)], // 左、上
+    ];
+    
+    for (int i = 0; i < corners.length; i++) {
+      final corner = corners[i];
+      final dirs = directions[i];
+      
+      // 绘制水平线
+      canvas.drawLine(
+        corner,
+        corner + dirs[0] * indicatorLength,
+        indicatorPaint,
+      );
+      
+      // 绘制垂直线
+      canvas.drawLine(
+        corner,
+        corner + dirs[1] * indicatorLength,
+        indicatorPaint,
+      );
     }
   }
 

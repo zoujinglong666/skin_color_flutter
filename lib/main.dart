@@ -242,8 +242,12 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     await _loadImageSize();
     _fadeController.forward();
     
-    // 自动进行人脸检测
-    await _performFaceDetection();
+    // 根据当前模式进行相应的分析
+    if (_analysisMode == AnalysisMode.faceDetection) {
+      await _performFaceDetection();
+    } else if (_analysisMode == AnalysisMode.smartAnalysis) {
+      await _startSmartAnalysisWithAnimation();
+    }
   }
 
   /// 加载图片尺寸
@@ -332,14 +336,20 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
   Future<void> _startSmartAnalysisWithAnimation() async {
     if (_selectedImage == null) return;
     
-    setState(() {
-      _isShowingScanAnimation = true;
-      _smartAnalysisPoints.clear();
-    });
+    print('开始智能分析动画'); // 调试日志
+    
+    // 确保在主线程中更新状态
+    if (mounted) {
+      setState(() {
+        _isShowingScanAnimation = true;
+        _smartAnalysisPoints.clear();
+        _analysisResults.clear(); // 清除之前的分析结果
+      });
+    }
     
     // 启动扫描动画
     _scanAnimationController.reset();
-    _scanAnimationController.forward();
+    await _scanAnimationController.forward();
     
     // 等待扫描动画完成一半后开始实际分析
     await Future.delayed(const Duration(milliseconds: 1000));
@@ -348,13 +358,17 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
     await _performSmartAnalysis();
     
     // 扫描完成，显示颜色指示点
-    setState(() {
-      _isShowingScanAnimation = false;
-    });
+    if (mounted) {
+      setState(() {
+        _isShowingScanAnimation = false;
+      });
+    }
     
     // 启动颜色点出现动画
     _colorPointAnimationController.reset();
-    _colorPointAnimationController.forward();
+    await _colorPointAnimationController.forward();
+    
+    print('智能分析动画完成'); // 调试日志
   }
 
   /// 智能分析模式 - 分析图片唯一主色 (升级版)
@@ -463,7 +477,7 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         
         // 生成智能分析的颜色指示点
         if (_displaySize != null && regionAnalysis.isNotEmpty) {
-          _smartAnalysisPoints.clear();
+          final newSmartAnalysisPoints = <Map<String, dynamic>>[];
           
           // 选择最具代表性的几个区域作为指示点
           final sortedRegions = regionAnalysis.entries.toList()
@@ -490,13 +504,20 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             // 分析颜色特征
             final result = _analyzeSkinTone(color, position, '区域 ${i + 1}');
             
-            _smartAnalysisPoints.add({
+            newSmartAnalysisPoints.add({
               'position': position,
               'color': color,
               'result': result,
               'regionKey': regionKey,
               'sampleCount': regionData['count'],
               'isSkinTone': regionData['isSkinTone'],
+            });
+          }
+          
+          // 更新状态
+          if (mounted) {
+            setState(() {
+              _smartAnalysisPoints = newSmartAnalysisPoints;
             });
           }
           
@@ -509,10 +530,14 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             
             final result = _analyzeSkinTone(selectedColor, centerPoint, regionDescription);
             
-            setState(() {
-              _analysisResults.add(result);
-            });
+            if (mounted) {
+              setState(() {
+                _analysisResults.add(result);
+              });
+            }
           }
+          
+          print('智能分析完成，生成了 ${newSmartAnalysisPoints.length} 个指示点'); // 调试日志
         }
       }
     } catch (e) {
@@ -1582,6 +1607,8 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
         color: Colors.transparent,
         child: InkWell(
           onTap: () {
+            // 先更新模式状态
+            final previousMode = _analysisMode;
             setState(() {
               _analysisMode = mode;
               // 切换模式时清理状态
@@ -1594,22 +1621,29 @@ class _SkinColorAnalyzerState extends State<SkinColorAnalyzer> with TickerProvid
             if (_selectedImage != null) {
               if (mode == AnalysisMode.faceDetection) {
                 // 切换到人脸模式，清除智能分析数据
-                _smartAnalysisPoints.clear();
+                setState(() {
+                  _smartAnalysisPoints.clear();
+                });
                 _performFaceDetection();
               } else if (mode == AnalysisMode.smartAnalysis) {
                 // 切换到智能模式，清除人脸检测数据并启动扫描动画
-                _detectedFaces.clear();
-                _rectStartPoint = null;
-                _currentDragPoint = null;
+                setState(() {
+                  _detectedFaces.clear();
+                  _rectStartPoint = null;
+                  _currentDragPoint = null;
+                });
+                // 无论是否是首次切换，都启动扫描动画
                 _startSmartAnalysisWithAnimation();
               } else {
                 // 切换到手动模式，清除所有检测数据
-                _detectedFaces.clear();
-                _smartAnalysisPoints.clear();
-                if (mode == AnalysisMode.manualRect) {
-                  _rectStartPoint = null;
-                  _currentDragPoint = null;
-                }
+                setState(() {
+                  _detectedFaces.clear();
+                  _smartAnalysisPoints.clear();
+                  if (mode == AnalysisMode.manualRect) {
+                    _rectStartPoint = null;
+                    _currentDragPoint = null;
+                  }
+                });
               }
             }
           },
@@ -2574,18 +2608,45 @@ class AnalysisPainter extends CustomPainter {
           
           final infoRect = Rect.fromCenter(
             center: infoPosition,
-            width: 140,
-            height: 30,
+            width: 160,
+            height: 32,
           );
           
           canvas.drawRRect(
-            RRect.fromRectAndRadius(infoRect, const Radius.circular(15)),
+            RRect.fromRectAndRadius(infoRect, const Radius.circular(16)),
             infoBgPaint,
           );
           
-          // 绘制颜色信息文字
-          final colorInfo = '${result.toneType}';
-          _drawText(canvas, colorInfo, infoPosition, Colors.white.withOpacity(lineOpacity));
+          // 绘制颜色指示块
+          final colorBlockPaint = Paint()
+            ..color = color.withOpacity(lineOpacity)
+            ..style = PaintingStyle.fill;
+          
+          final colorBlockRect = Rect.fromCenter(
+            center: Offset(infoPosition.dx - 55, infoPosition.dy),
+            width: 20,
+            height: 20,
+          );
+          
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(colorBlockRect, const Radius.circular(4)),
+            colorBlockPaint,
+          );
+          
+          // 绘制颜色块边框
+          final colorBlockBorderPaint = Paint()
+            ..color = Colors.white.withOpacity(0.8 * lineOpacity)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.0;
+          
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(colorBlockRect, const Radius.circular(4)),
+            colorBlockBorderPaint,
+          );
+          
+          // 绘制颜色信息文字（调整位置以适应颜色块）
+          final colorInfo = result.toneType;
+          _drawText(canvas, colorInfo, Offset(infoPosition.dx - 15, infoPosition.dy), Colors.white.withOpacity(lineOpacity));
         }
       }
     }
